@@ -103,6 +103,8 @@ class MicSession:
             self._emit_state("playing")
 
     def feed(self, data: bytes) -> None:
+        # start 없이 오디오가 먼저 와도 시작으로 본다 (API 계약 Q-API-5)
+        self.begin()
         self.source.feed(data)
 
     async def stop(self) -> None:
@@ -202,7 +204,7 @@ class MicSession:
             log.exception("final STT 실패 seg=%s", seg.seg_id)
             self._last_final_id = max(self._last_final_id, seg.seg_id)
             self._emit(
-                "error", error_payload("stt_failed", f"발화 {seg.seg_id} 인식 실패: {e}", True)
+                "error", error_payload("E_STT_FAILED", f"발화 {seg.seg_id} 인식 실패: {e}", True)
             )
             return
         # 환각 방지: 직전과 똑같은 문장 반복은 비운다 (§4.3)

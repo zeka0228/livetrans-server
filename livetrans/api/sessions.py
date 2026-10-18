@@ -38,7 +38,7 @@ class DisplaySpec(BaseModel):
 class SessionCreate(BaseModel):
     mode: str
     source: SourceSpec
-    src_lang: str = "auto"
+    src_lang: str | None = "auto"  # "auto" 와 null 모두 자동 감지 (API 계약 Q-API-1)
     tgt_lang: str = "ko"
     delay_s: int | None = None
     tts: TtsSpec = TtsSpec()
@@ -58,7 +58,7 @@ async def create_session(body: SessionCreate, request: Request) -> dict:
     if body.mode != "C" or body.source.type != "mic_ws":
         raise _error(
             501,
-            "not_implemented",
+            "E_NOT_IMPLEMENTED",
             f"mode={body.mode}, source={body.source.type} 는 아직 지원하지 않습니다 (현재: mode C + mic_ws)",
         )
     app = request.app
@@ -66,7 +66,7 @@ async def create_session(body: SessionCreate, request: Request) -> dict:
         app.state.settings,
         app.state.stt,
         app.state.vad_factory(),
-        src_lang=None if body.src_lang == "auto" else body.src_lang,
+        src_lang=None if body.src_lang in (None, "auto") else body.src_lang,
     )
     await session.start()
     _sessions(app)[session.session_id] = session
@@ -82,7 +82,7 @@ async def create_session(body: SessionCreate, request: Request) -> dict:
 async def stop_session(session_id: str, request: Request) -> dict:
     session = _sessions(request.app).get(session_id)
     if session is None:
-        raise _error(404, "session_not_found", f"세션이 없습니다: {session_id}")
+        raise _error(404, "E_SESSION_NOT_FOUND", f"세션이 없습니다: {session_id}")
     await session.stop()
     _sessions(request.app).pop(session_id, None)
     return {"session_id": session_id, "stopped": True}

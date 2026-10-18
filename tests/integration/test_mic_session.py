@@ -79,7 +79,7 @@ def test_create_session_response_shape(client):
 def test_unsupported_mode_returns_501(client):
     r = client.post("/api/sessions", json={"mode": "A", "source": {"type": "obs_stream"}})
     assert r.status_code == 501
-    assert r.json()["detail"]["code"] == "not_implemented"
+    assert r.json()["detail"]["code"] == "E_NOT_IMPLEMENTED"
 
 
 def test_mic_flow_emits_finals_and_flushes_on_stop(client):
@@ -159,3 +159,19 @@ def test_unknown_session_ws_closes_4404(client):
     ):
         ws.receive_text()
     assert exc.value.code == 4404
+
+
+def test_null_src_lang_means_auto_and_audio_without_start_begins(client):
+    r = client.post(
+        "/api/sessions",
+        json={"mode": "C", "source": {"type": "mic_ws"}, "src_lang": None},
+    )
+    assert r.status_code == 200
+    with client.websocket_connect(r.json()["ws_url"]) as ws:
+        ws.receive_text()
+        send_audio(ws, np.concatenate([tone(1.0), silence(1.0)]))
+        ws.send_text(json.dumps({"type": "control", "payload": {"action": "stop"}}))
+        events = collect_until_stopped(ws)
+    states = [e["payload"]["state"] for e in events if e["type"] == "session.state"]
+    assert states == ["playing", "stopped"]
+    assert client.stt.calls[-1]["lang"] is None
