@@ -1,0 +1,24 @@
+# 기본 설정 (기술 명세서 §7). 개인 설정은 config/default.local.yaml 로 덮어쓴다 (gitignore).
+# 구현된 섹션만 둔다. 미구현 섹션(mt·timeline·tts)은 해당 단계에서 추가.
+server:
+  host: "127.0.0.1"
+  port: 8765
+audio:
+  sample_rate: 16000
+vad:
+  threshold: 0.5
+  min_speech_ms: 250
+  min_silence_ms: 600
+  speech_pad_ms: 200
+  max_utterance_s: 8.0
+stt:
+  engine: faster_whisper      # faster_whisper | fake
+  model: "large-v3"
+  device: "cuda"
+  compute_type: "float16"
+  beam_final: 5
+  beam_partial: 1
+  language: null              # null = 자동 감지, 또는 "ko" | "en" | "ja"
+logging:
+  dir: "logs"
+  per_session_jsonl: true

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# 개인 설정·로컬 전용 (공유 클론 안전 수칙 6)
+*.local.yaml
+*.local.py
+*.local.*
+.env
+plugins_local/
+
+# 실행 산출물
+logs/
+hls/
+tests/fixtures/local/
+
+# IDE
+.vscode/
+.idea/
