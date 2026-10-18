@@ -13,5 +13,7 @@ if errorlevel 1 (
   echo [setup] uv sync failed.
   exit /b 1
 )
+call scripts\build_wincap.bat
+if errorlevel 1 echo [setup] wincap skipped: mode B capture unavailable, other features work.
 echo [setup] done. Run scripts\run_server.bat
 endlocal

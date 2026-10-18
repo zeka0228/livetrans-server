@@ -1,4 +1,6 @@
-"""세션: 입력 → 세그먼터 → STT → WS 이벤트 (M1 범위: 모드 C 마이크).
+"""세션: 입력 → 세그먼터 → STT → WS 이벤트.
+
+모드 C = 앱 마이크(`mic_ws`), 모드 B = PC 에서 재생 중인 소리 캡처(`loopback`, D-016). 입력만 다르고 처리는 같다.
 
 두 개의 태스크로 돈다.
 - ingest: 소스 프레임을 세그먼터에 넣고, 확정 발화와 중간 결과 요청을 STT 작업으로 넘긴다.
@@ -26,7 +28,8 @@ from livetrans.core.events import (
     session_state_payload,
 )
 from livetrans.pipeline.segmenter import PartialRequest, Segmenter, SpeechSegment
-from livetrans.plugins.source.mic_ws import MicWsSource
+from livetrans.plugins.source.base import Source
+from livetrans.plugins.source.loopback import CaptureError
 from livetrans.plugins.stt.base import STTEngine, Transcript
 
 log = logging.getLogger("livetrans.session")
@@ -51,22 +54,25 @@ def final_payload(seg: SpeechSegment, tr: Transcript, stt_ms: int) -> dict:
     }
 
 
-class MicSession:
-    mode = "C"
-
+class Session:
     def __init__(
         self,
         settings: Settings,
         stt: STTEngine,
         vad: Callable[[np.ndarray], float],
+        source: Source,
         *,
+        mode: str,
         src_lang: str | None,
         session_id: str | None = None,
     ) -> None:
         self.session_id = session_id or uuid.uuid4().hex[:12]
+        self.mode = mode
         self.src_lang = src_lang
         self.stt = stt
-        self.source = MicWsSource(settings.audio.sample_rate)
+        self.source = source
+        # 캡처 소스는 control start 때 켠다 (그 전 소리는 받지 않음). 마이크는 앱이 보내는 대로 받는다.
+        self._start_source_on_begin = mode == "B"
         self.segmenter = Segmenter(
             settings.vad,
             vad,
@@ -90,21 +96,33 @@ class MicSession:
     # --- 수명 주기 ---
 
     async def start(self) -> None:
-        await self.source.start()
+        if not self._start_source_on_begin:
+            await self.source.start()
         self._tasks = [
             asyncio.create_task(self._ingest_loop(), name=f"ingest-{self.session_id}"),
             asyncio.create_task(self._stt_loop(), name=f"stt-{self.session_id}"),
         ]
         self._emit_state("starting")
 
-    def begin(self) -> None:
-        """앱의 `control: start`. 모드 C 에는 지연 버퍼가 없으므로 바로 playing."""
-        if self.state == "starting":
-            self._emit_state("playing")
+    async def begin(self) -> None:
+        """앱의 `control: start`. 모드 B·C 에는 지연 버퍼가 없으므로 바로 playing."""
+        if self.state != "starting":
+            return
+        if self._start_source_on_begin:
+            try:
+                await self.source.start()
+            except (CaptureError, TimeoutError) as e:
+                self._emit("error", error_payload("E_CAPTURE_START", f"캡처 시작 실패: {e}", False))
+                await self.stop()
+                return
+        self._emit_state("playing")
 
     def feed(self, data: bytes) -> None:
-        # start 없이 오디오가 먼저 와도 시작으로 본다 (API 계약 Q-API-5)
-        self.begin()
+        """모드 C 바이너리 PCM. start 없이 오디오가 먼저 와도 시작으로 본다 (API 계약 Q-API-5)."""
+        if self.mode != "C":
+            return
+        if self.state == "starting":
+            self._emit_state("playing")
         self.source.feed(data)
 
     async def stop(self) -> None:
@@ -116,6 +134,10 @@ class MicSession:
     async def _stop(self) -> None:
         await self.source.stop()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        lost = getattr(self.source, "lost_reason", None)
+        if lost:
+            # 남은 final 을 전부 보낸 뒤, stopped 바로 앞에 보낸다 (앱은 이 오류를 받으면 바로 세션을 끝낸다)
+            self._emit("error", error_payload("E_CAPTURE_LOST", lost, False))
         self._emit_state("stopped")
 
     async def abort(self) -> None:
@@ -150,6 +172,9 @@ class MicSession:
         self._finals.extend(self.segmenter.flush())
         self._ingest_done = True
         self._wake.set()
+        if getattr(self.source, "lost_reason", None) and self._stopping is None:
+            # 캡처 대상이 사라짐(창 종료 등): 남은 발화까지 인식하고 세션을 끝낸다. 오류는 _stop 에서 보낸다
+            asyncio.get_running_loop().create_task(self.stop())
 
     async def _stt_loop(self) -> None:
         while True:
