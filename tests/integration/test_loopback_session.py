@@ -158,8 +158,9 @@ def test_capture_lost_emits_error_and_stops_by_itself():
     assert errors == [
         {"code": "E_CAPTURE_LOST", "message": "ERROR target process exited", "recoverable": False}
     ]
-    # 끊기기 전까지 받은 발화는 끝까지 인식한다
+    # 끊기기 전까지 받은 발화는 끝까지 인식하고, 오류는 모든 final 뒤 · stopped 바로 앞에 온다
     assert len([e for e in events if e["type"] == "segment.final"]) == 2
+    assert [e["type"] for e in events[-2:]] == ["error", "session.state"]
 
 
 def test_capture_start_failure():

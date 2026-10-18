@@ -134,6 +134,10 @@ class Session:
     async def _stop(self) -> None:
         await self.source.stop()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        lost = getattr(self.source, "lost_reason", None)
+        if lost:
+            # 남은 final 을 전부 보낸 뒤, stopped 바로 앞에 보낸다 (앱은 이 오류를 받으면 바로 세션을 끝낸다)
+            self._emit("error", error_payload("E_CAPTURE_LOST", lost, False))
         self._emit_state("stopped")
 
     async def abort(self) -> None:
@@ -168,10 +172,8 @@ class Session:
         self._finals.extend(self.segmenter.flush())
         self._ingest_done = True
         self._wake.set()
-        lost = getattr(self.source, "lost_reason", None)
-        if lost and self._stopping is None:
-            # 캡처 대상이 사라짐(창 종료 등): 남은 발화까지 인식하고 세션을 끝낸다
-            self._emit("error", error_payload("E_CAPTURE_LOST", lost, False))
+        if getattr(self.source, "lost_reason", None) and self._stopping is None:
+            # 캡처 대상이 사라짐(창 종료 등): 남은 발화까지 인식하고 세션을 끝낸다. 오류는 _stop 에서 보낸다
             asyncio.get_running_loop().create_task(self.stop())
 
     async def _stt_loop(self) -> None:
