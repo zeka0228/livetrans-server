@@ -1,4 +1,7 @@
-"""세션 REST + WebSocket (명세 §6.1, §6.2). M1 에서는 모드 C(`mic_ws`)만 지원한다."""
+"""세션 REST + WebSocket (명세 §6.1, §6.2).
+
+지원 조합: 모드 C + `mic_ws`(앱 마이크), 모드 B + `loopback`(PC 소리 캡처, D-016).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +13,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from livetrans.pipeline.session import MicSession
+from livetrans.pipeline.session import Session
+from livetrans.plugins.source.loopback import parse_target
+from livetrans.plugins.source.mic_ws import MicWsSource
 
 log = logging.getLogger("livetrans.api")
 
@@ -49,23 +54,32 @@ def _error(status: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status, detail={"code": code, "message": message})
 
 
-def _sessions(app) -> dict[str, MicSession]:
+def _sessions(app) -> dict[str, Session]:
     return app.state.sessions
 
 
 @router.post("/api/sessions")
 async def create_session(body: SessionCreate, request: Request) -> dict:
-    if body.mode != "C" or body.source.type != "mic_ws":
+    app = request.app
+    sample_rate = app.state.settings.audio.sample_rate
+    combo = (body.mode, body.source.type)
+    if combo == ("C", "mic_ws"):
+        source = MicWsSource(sample_rate)
+    elif combo == ("B", "loopback"):
+        source = await _loopback_source(app, body.source.params, sample_rate)
+    else:
         raise _error(
             501,
             "E_NOT_IMPLEMENTED",
-            f"mode={body.mode}, source={body.source.type} 는 아직 지원하지 않습니다 (현재: mode C + mic_ws)",
+            f"mode={body.mode}, source={body.source.type} 는 아직 지원하지 않습니다"
+            " (현재: mode C + mic_ws, mode B + loopback)",
         )
-    app = request.app
-    session = MicSession(
+    session = Session(
         app.state.settings,
         app.state.stt,
         app.state.vad_factory(),
+        source,
+        mode=body.mode,
         src_lang=None if body.src_lang in (None, "auto") else body.src_lang,
     )
     await session.start()
@@ -76,6 +90,29 @@ async def create_session(body: SessionCreate, request: Request) -> dict:
         "hls_url": None,
         "ws_url": f"/ws/sessions/{session.session_id}",
     }
+
+
+async def _loopback_source(app, params: dict[str, Any], sample_rate: int):
+    backend = app.state.capture
+    if not backend.available():
+        raise _error(
+            503, "E_CAPTURE_UNAVAILABLE", "캡처 헬퍼가 없습니다 (scripts\\build_wincap.bat)"
+        )
+    target = str(params.get("target", "system"))
+    try:
+        parse_target(target)
+    except ValueError as e:
+        raise _error(400, "E_CAPTURE_TARGET", str(e)) from e
+    # 창 목록은 UI 용. 대상은 살아 있는 프로세스면 된다 (창 없는 프로세스의 소리도 캡처 가능)
+    if target != "system" and (
+        not backend.app_capture_supported() or not backend.process_alive(int(target[4:]))
+    ):
+        raise _error(
+            400,
+            "E_CAPTURE_TARGET",
+            f"캡처할 수 없는 대상입니다 (창이 닫혔거나 미지원): {target}",
+        )
+    return backend.create_source(target, sample_rate)
 
 
 @router.post("/api/sessions/{session_id}/stop")
@@ -124,7 +161,7 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
             elif msg.get("text"):
                 action = _parse_control(msg["text"])
                 if action == "start":
-                    session.begin()
+                    await session.begin()
                 elif action == "stop" and stop_task is None:
                     stop_task = asyncio.create_task(session.stop())
         # stopped 를 보냈으면 서버가 닫는다

@@ -11,7 +11,7 @@
 
 ## 실행
 
-요구 사항: Windows, NVIDIA GPU(CUDA 12 드라이버), [uv](https://docs.astral.sh/uv/).
+요구 사항: Windows, NVIDIA GPU(CUDA 12 드라이버), [uv](https://docs.astral.sh/uv/). PC 소리 캡처(모드 B)를 쓰려면 [.NET SDK 8+](https://dotnet.microsoft.com/download) 도 필요합니다 (`setup.bat` 이 `tools/wincap` 캡처 헬퍼를 빌드).
 
 ```bat
 scripts\setup.bat
