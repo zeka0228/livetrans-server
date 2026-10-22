@@ -23,3 +23,8 @@ tests/fixtures/local/
 # IDE
 .vscode/
 .idea/
+
+# wincap (C#) 빌드 산출물
+tools/wincap/bin/
+tools/wincap/obj/
+tools/wincap/out/
