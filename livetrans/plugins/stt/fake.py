@@ -12,6 +12,7 @@ class FakeSTT:
     name = "fake"
     model_id = "fake"
     languages = ("ko", "en", "ja")
+    supports_speaker_mask = True
 
     def __init__(
         self, *, latency_s: float = 0.0, lang: str = "ko", lang_prob: float = 0.99
@@ -25,9 +26,23 @@ class FakeSTT:
         return None
 
     async def transcribe(
-        self, seg: SpeechSegment, *, lang: str | None, prompt: str | None, final: bool
+        self,
+        seg: SpeechSegment,
+        *,
+        lang: str | None,
+        prompt: str | None,
+        final: bool,
+        speaker: str | None = None,
     ) -> Transcript:
-        self.calls.append({"seg_id": seg.seg_id, "lang": lang, "prompt": prompt, "final": final})
+        self.calls.append(
+            {
+                "seg_id": seg.seg_id,
+                "lang": lang,
+                "prompt": prompt,
+                "final": final,
+                "speaker": speaker,
+            }
+        )
         if self.latency_s:
             await asyncio.sleep(self.latency_s)
         dur = seg.t_end_ms - seg.t_start_ms
@@ -41,6 +56,7 @@ class FakeSTT:
             lang_prob=1.0 if lang else self.lang_prob,
             words=words,
             latency_ms=int(self.latency_s * 1000),
+            speaker=speaker,
         )
 
     async def close(self) -> None:

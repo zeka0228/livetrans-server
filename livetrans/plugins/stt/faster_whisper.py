@@ -7,22 +7,20 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 
 from livetrans.core.config import SttConfig
+from livetrans.core.gpu import GPU_LOCK
 from livetrans.pipeline.segmenter import SpeechSegment
 from livetrans.plugins.stt.base import Transcript, Word
 
 PROMPT_MAX_CHARS = 200
 
-# STT·번역이 같은 GPU 를 쓰므로 GPU 작업은 이 락 아래에서만 실행한다
-GPU_LOCK = threading.Lock()
-
 
 class FasterWhisperSTT:
     name = "faster_whisper"
     languages = ("ko", "en", "ja")
+    supports_speaker_mask = False  # speaker 는 무시하고 구간 전체를 1회 인식한다 (§4.3)
 
     def __init__(self, cfg: SttConfig) -> None:
         self.cfg = cfg
@@ -41,11 +39,19 @@ class FasterWhisperSTT:
         )
 
     async def transcribe(
-        self, seg: SpeechSegment, *, lang: str | None, prompt: str | None, final: bool
+        self,
+        seg: SpeechSegment,
+        *,
+        lang: str | None,
+        prompt: str | None,
+        final: bool,
+        speaker: str | None = None,
     ) -> Transcript:
         if self._model is None:
             raise RuntimeError("STT 모델이 로드되지 않았습니다")
-        return await asyncio.to_thread(self._transcribe_blocking, seg, lang, prompt, final)
+        tr = await asyncio.to_thread(self._transcribe_blocking, seg, lang, prompt, final)
+        tr.speaker = speaker
+        return tr
 
     def _transcribe_blocking(
         self, seg: SpeechSegment, lang: str | None, prompt: str | None, final: bool

@@ -16,11 +16,12 @@ VAD 는 `Callable[[np.ndarray], float]` 로 주입한다. 실제로는 `Streamin
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from livetrans.core.config import VadConfig
+from livetrans.core.speaker import SpeakerTurn
 
 WINDOW_SAMPLES = 512
 FORCED_CUT_SEARCH_S = 1.5
@@ -34,6 +35,8 @@ class SpeechSegment:
     pcm: np.ndarray  # float32 mono
     forced_cut: bool = False
     prev_seg_id: int | None = None
+    speakers: tuple[str, ...] = ()  # v0.4: 이 구간에 있는 화자 (Diarizer 가 채움, 없으면 빈 튜플)
+    speaker_turns: list[SpeakerTurn] = field(default_factory=list)  # v0.4: §4.8, STT 화자 마스크용
 
 
 @dataclass

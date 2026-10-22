@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
+
+# STT·화자 분할·번역이 같은 GPU 를 쓰므로 GPU 작업은 이 락 아래에서만 실행한다 (명세 §2.3)
+GPU_LOCK = threading.Lock()
 
 
 def prepare_cuda_dlls() -> list[Path]:
