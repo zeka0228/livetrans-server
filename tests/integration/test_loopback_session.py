@@ -85,6 +85,7 @@ def make_client(**source_kw):
         stt=FakeSTT(lang="ja"),
         vad_factory=lambda: energy_vad,
         capture=backend,
+        tts_engines={},
     )
     return TestClient(app), backend
 

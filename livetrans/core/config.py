@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # 저장소 루트/config
 DEFAULT_CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
@@ -42,6 +42,23 @@ class SttConfig(BaseModel):
     language: str | None = None
 
 
+def _default_tts_engines() -> dict[str, dict[str, Any]]:
+    return {"system": {"type": "system"}, "openjtalk": {"type": "openjtalk"}}
+
+
+def _default_tts_voices() -> dict[str, str]:
+    return {"ko-KR": "system:auto", "en-US": "system:auto", "ja-JP": "openjtalk:default"}
+
+
+class TtsConfig(BaseModel):
+    """엔진 인스턴스와 언어별 기본 음성 (명세 §5.4 를 default.yaml 의 tts 섹션으로)."""
+
+    engines: dict[str, dict[str, Any]] = Field(default_factory=_default_tts_engines)
+    defaults: dict[str, str] = Field(default_factory=_default_tts_voices)
+    max_chars: int = 500
+    cache_items: int = 128
+
+
 class LoggingConfig(BaseModel):
     dir: str = "logs"
     per_session_jsonl: bool = True
@@ -52,6 +69,7 @@ class Settings(BaseModel):
     audio: AudioConfig = AudioConfig()
     vad: VadConfig = VadConfig()
     stt: SttConfig = SttConfig()
+    tts: TtsConfig = TtsConfig()
     logging: LoggingConfig = LoggingConfig()
 
 

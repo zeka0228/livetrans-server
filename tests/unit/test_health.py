@@ -5,7 +5,7 @@ from livetrans.main import create_app
 
 
 def test_health_shape():
-    app = create_app(Settings(stt=SttConfig(engine="fake")))
+    app = create_app(Settings(stt=SttConfig(engine="fake")), tts_engines={})
     with TestClient(app) as client:
         r = client.get("/api/health")
     assert r.status_code == 200
