@@ -19,6 +19,16 @@ stt:
   beam_final: 5
   beam_partial: 1
   language: null              # null = 자동 감지, 또는 "ko" | "en" | "ja"
+tts:
+  engines:                    # 엔진 인스턴스 (명세 §5.4). 개인 엔진은 default.local.yaml 에 추가
+    system:    { type: system }      # Windows 기본 음성 (SAPI)
+    openjtalk: { type: openjtalk }   # 일본어 기본 음성 (D-018)
+  defaults:                   # 언어별 기본 음성 "<엔진>:<voice_id>", auto = 그 엔진에서 언어가 맞는 첫 음성
+    ko-KR: "system:auto"
+    en-US: "system:auto"
+    ja-JP: "openjtalk:default"
+  max_chars: 500
+  cache_items: 128
 logging:
   dir: "logs"
   per_session_jsonl: true

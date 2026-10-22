@@ -33,7 +33,10 @@ def silence(seconds: float) -> np.ndarray:
 def client():
     stt = FakeSTT()
     app = create_app(
-        Settings(stt=SttConfig(engine="fake")), stt=stt, vad_factory=lambda: energy_vad
+        Settings(stt=SttConfig(engine="fake")),
+        stt=stt,
+        vad_factory=lambda: energy_vad,
+        tts_engines={},
     )
     with TestClient(app) as c:
         c.stt = stt
