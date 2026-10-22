@@ -25,12 +25,14 @@ class Transcript:
     words: list[Word] = field(default_factory=list)
     avg_logprob: float = 0.0
     latency_ms: int = 0
+    speaker: str | None = None  # v0.4: 화자 조건부 엔진이면 대상 화자, 아니면 None
 
 
 class STTEngine(Protocol):
     name: str
     model_id: str
     languages: tuple[str, ...]
+    supports_speaker_mask: bool  # v0.4: True 면 speaker·seg.speaker_turns 를 사용 (DiCoW)
 
     async def load(self) -> None: ...
 
@@ -41,6 +43,7 @@ class STTEngine(Protocol):
         lang: str | None,
         prompt: str | None,
         final: bool,
+        speaker: str | None = None,
     ) -> Transcript: ...
 
     async def close(self) -> None: ...

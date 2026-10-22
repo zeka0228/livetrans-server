@@ -33,8 +33,12 @@ class VadConfig(BaseModel):
 
 
 class SttConfig(BaseModel):
-    engine: str = "faster_whisper"
-    model: str = "large-v3"
+    engine: str = "faster_whisper"  # dicow | faster_whisper | fake
+    model: str = (
+        "large-v3"  # dicow: HF 모델 id (BUT-FIT/DiCoW_v3_3), faster_whisper: 모델명 또는 HF id
+    )
+    fallback: str | None = None  # 기본 엔진 로드 실패 시 쓸 엔진 (R-15)
+    fallback_model: str = "large-v3"
     device: str = "cuda"
     compute_type: str = "float16"
     beam_final: int = 5

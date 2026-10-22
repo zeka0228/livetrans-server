@@ -2,7 +2,7 @@
 
 실시간 방송 번역기의 백엔드 서버입니다. 외국어 라이브 방송을 최악 처리 시간 이상으로 고정 지연(D초)해 재생하고, 그 사이에 STT → 번역 → TTS를 끝내 자막·번역 음성을 원래 발화 타이밍에 맞춰 내보내는 것이 목표입니다. 재생은 어떤 경우에도 멈추지 않습니다.
 
-- 스택: Python 3.11 · FastAPI · faster-whisper (CTranslate2, CUDA) · Silero VAD
+- 스택: Python 3.11 · FastAPI · DiCoW (PyTorch · transformers) / faster-whisper (CTranslate2) · Silero VAD
 - 프론트엔드(Flutter)는 별도 저장소입니다.
 
 ## 설계 문서
@@ -19,6 +19,18 @@ scripts\run_server.bat
 ```
 
 기본 주소는 `http://127.0.0.1:8765` 이며 `GET /api/health` 로 상태를 확인합니다. 개인 설정은 `config/default.local.yaml` 에 두면 `config/default.yaml` 위에 덮어써집니다 (gitignore).
+
+### 모델 내려받기
+
+STT 모델 가중치는 저장소에 없고 첫 실행 전에 받아야 합니다 (받지 않으면 서버 기동 시 Hugging Face 에서 자동으로 받느라 오래 걸립니다).
+
+```bat
+uv run python scripts\download_models.py            # DiCoW v3.3 + faster-whisper large-v3 (기본 STT 세트)
+uv run python scripts\download_models.py --all      # + kotoba-whisper(일본어 대안), pyannote 화자 분할(토큰 필요), Bandit v2 분리 모델
+```
+
+- 기본 STT 는 **DiCoW** (화자 조건부 Whisper, `stt.engine: dicow`) 이고 로드에 실패하면 `stt.fallback` 의 faster-whisper large-v3 로 자동 전환됩니다. 엔진·모델은 `config/default.local.yaml` 의 `stt` 섹션으로 바꿉니다.
+- 사용하는 모델·소프트웨어의 출처와 라이선스(출처 표기 의무 포함)는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 에 있습니다.
 
 테스트:
 
