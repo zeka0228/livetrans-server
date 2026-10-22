@@ -19,6 +19,8 @@ dependencies = [
     "torch>=2.9,<2.10",
     "transformers>=4.55,<4.56",
     "pandas>=3.1.0",
+    "pyannote-audio>=4.0,<5",
+    "torchaudio>=2.9,<2.10",
 ]
 
 [dependency-groups]
@@ -39,6 +41,7 @@ packages = ["livetrans"]
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -50,3 +53,4 @@ target-version = "py311"
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }

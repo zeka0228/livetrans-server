@@ -18,6 +18,11 @@ import sys
 import urllib.request
 from pathlib import Path
 
+# Windows 콘솔(cp949)에서 유니코드 메시지가 깨지지 않게
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = Path(__file__).resolve().parents[1]
 MODELS_DIR = ROOT / "models"
 

@@ -16,6 +16,8 @@ from livetrans.api.tts import router as tts_router
 from livetrans.core.config import Settings, load_settings
 from livetrans.core.gpu import prepare_cuda_dlls
 from livetrans.core.voices import VoiceRegistry
+from livetrans.plugins.diar import create_diarizer
+from livetrans.plugins.diar.base import DiarizerEngine
 from livetrans.plugins.source.loopback import CaptureBackend
 from livetrans.plugins.stt import create_stt
 from livetrans.plugins.stt.base import STTEngine
@@ -48,6 +50,24 @@ async def _load_tts(settings: Settings) -> dict[str, TTSEngine]:
     return engines
 
 
+async def _load_diarizer(
+    settings: Settings, injected: DiarizerEngine | None
+) -> DiarizerEngine | None:
+    """설정의 화자 분할 엔진을 로드한다. 실패하면 경고만 남기고 화자 없이 뜬다 (자막은 계속 나와야 한다)."""
+    engine = injected or create_diarizer(settings.diar)
+    if engine is None:
+        return None
+    try:
+        await engine.load()
+    except Exception as e:  # noqa: BLE001 — 토큰·모델 문제로 화자 분할이 안 떠도 서버는 떠야 한다
+        log.warning(
+            "화자 분할 엔진 %s(%s) 로드 실패 → 화자 없이 진행: %s", engine.name, engine.model_id, e
+        )
+        return None
+    log.info("화자 분할 로드: %s (%s)", engine.name, engine.model_id)
+    return engine
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -55,8 +75,9 @@ def create_app(
     vad_factory: VadFactory | None = None,
     capture: CaptureBackend | None = None,
     tts_engines: dict[str, TTSEngine] | None = None,
+    diar: DiarizerEngine | None = None,
 ) -> FastAPI:
-    """stt·vad_factory·capture·tts_engines 는 테스트에서 가짜를 주입할 때만 넘긴다."""
+    """stt·vad_factory·capture·tts_engines·diar 는 테스트에서 가짜를 주입할 때만 넘긴다."""
     settings = settings or load_settings()
 
     @asynccontextmanager
@@ -69,6 +90,7 @@ def create_app(
         await engine.load()
         app.state.settings = settings
         app.state.stt = engine
+        app.state.diar = await _load_diarizer(settings, diar)
         app.state.vad_factory = vad_factory or _silero_factory
         app.state.capture = capture or CaptureBackend()
         voices = VoiceRegistry(
@@ -78,14 +100,17 @@ def create_app(
         )
         await voices.refresh()
         app.state.voices = voices
-        app.state.models_loaded = [f"stt:{engine.name}:{engine.model_id}"] + [
-            f"tts:{name}" for name in voices.engines
-        ]
+        app.state.models_loaded = [f"stt:{engine.name}:{engine.model_id}"]
+        if app.state.diar is not None:
+            app.state.models_loaded.append(f"diar:{app.state.diar.name}:{app.state.diar.model_id}")
+        app.state.models_loaded += [f"tts:{name}" for name in voices.engines]
         app.state.sessions = {}
         yield
         for session in list(app.state.sessions.values()):
             await session.abort()
         await engine.close()
+        if app.state.diar is not None:
+            await app.state.diar.close()
         for tts in voices.engines.values():
             await tts.close()
 

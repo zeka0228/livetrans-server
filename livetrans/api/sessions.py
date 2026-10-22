@@ -81,6 +81,7 @@ async def create_session(body: SessionCreate, request: Request) -> dict:
         source,
         mode=body.mode,
         src_lang=None if body.src_lang in (None, "auto") else body.src_lang,
+        diarizer=app.state.diar.create() if app.state.diar is not None else None,
     )
     await session.start()
     _sessions(app)[session.session_id] = session

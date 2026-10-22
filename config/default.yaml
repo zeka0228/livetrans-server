@@ -21,6 +21,16 @@ stt:
   beam_final: 5
   beam_partial: 1
   language: null              # null = 자동 감지, 또는 "ko" | "en" | "ja"
+diar:
+  engine: none                # none | pyannote  (D-021). 앱이 API 계약 S-17(speaker 필드)을 반영하기 전까지 기본 none.
+                              # 켜려면 default.local.yaml 에 diar: {engine: pyannote}. 모델은 HF 이용 조건 동의 + 토큰 필요:
+                              #   scripts/download_models.py --diar  (토큰은 hf auth login 또는 HF_TOKEN)
+  model: "pyannote/speaker-diarization-community-1"   # CC BY 4.0, THIRD_PARTY_NOTICES.md
+  device: "cuda"
+  max_speakers: 4             # 세션당 화자 상한
+  max_speakers_per_seg: 2     # 구간당 동시 화자 상한 k. 화자마다 STT 1회 → segment.final 이 화자별로 1개씩
+  match_threshold: 0.5        # 기존 화자로 볼 코사인 하한 (LDA 공간). 합성음 측정: 같은 화자 평균 0.65, 다른 화자 0.30 — 실방송으로 재조정
+  min_speaker_ms: 300         # 구간 안에서 이보다 짧게 말한 화자는 버림
 tts:
   engines:                    # 엔진 인스턴스 (명세 §5.4). 개인 엔진은 default.local.yaml 에 추가
     system:    { type: system }      # Windows 기본 음성 (SAPI)
