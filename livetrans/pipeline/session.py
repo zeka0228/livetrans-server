@@ -282,7 +282,13 @@ class Session:
                     # 입력 끝: 받은 오디오 끝까지만 합성하고 종료 (마지막 자막·TTS 가 들어갈 여유 1 세그먼트)
                     if tl.segment_bounds_ms(k)[0] >= self.ring.total_ms + int(tl.segment_s * 1000):
                         break
-                if self.state == "buffering" and time.time() >= tl.play_wall(0):
+                if (
+                    self.state == "buffering"
+                    and time.time() >= tl.play_wall(0)
+                    and getattr(
+                        self.hls, "ready", True
+                    )  # 플레이리스트가 생긴 뒤에야 재생 시작을 알린다
+                ):
                     self.state = "playing"
                     self._emit(
                         "session.state",

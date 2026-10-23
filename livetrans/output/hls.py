@@ -155,6 +155,15 @@ class HlsWriter:
         return self._proc is not None and self._proc.poll() is None
 
     @property
+    def ready(self) -> bool:
+        """플레이어가 열 수 있는 상태: 미디어 플레이리스트에 세그먼트가 하나 이상."""
+        m = self.dir / "media.m3u8"
+        try:
+            return m.is_file() and ".ts" in m.read_text(encoding="utf-8")
+        except OSError:
+            return False
+
+    @property
     def last_error(self) -> str:
         return " | ".join(list(self._stderr)[-3:])
 
@@ -283,3 +292,7 @@ class AsyncHlsWriter:
     @property
     def alive(self) -> bool:
         return self.inner.alive
+
+    @property
+    def ready(self) -> bool:
+        return self.inner.ready
