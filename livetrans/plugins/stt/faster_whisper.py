@@ -46,6 +46,7 @@ class FasterWhisperSTT:
         prompt: str | None,
         final: bool,
         speaker: str | None = None,
+        anti_repeat: bool = False,  # faster-whisper 는 자체 온도 재시도·압축비 검사가 있어 무시
     ) -> Transcript:
         if self._model is None:
             raise RuntimeError("STT 모델이 로드되지 않았습니다")

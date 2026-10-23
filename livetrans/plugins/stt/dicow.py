@@ -114,10 +114,13 @@ class DiCoWSTT:
         prompt: str | None,
         final: bool,
         speaker: str | None = None,
+        anti_repeat: bool = False,
     ) -> Transcript:
         if self._model is None:
             raise RuntimeError("STT 모델이 로드되지 않았습니다")
-        return await asyncio.to_thread(self._transcribe_blocking, seg, lang, prompt, final, speaker)
+        return await asyncio.to_thread(
+            self._transcribe_blocking, seg, lang, prompt, final, speaker, anti_repeat
+        )
 
     def _transcribe_blocking(
         self,
@@ -126,6 +129,7 @@ class DiCoWSTT:
         prompt: str | None,
         final: bool,
         speaker: str | None,
+        anti_repeat: bool = False,
     ) -> Transcript:
         import torch
 
@@ -170,6 +174,10 @@ class DiCoWSTT:
             }
             if prompt_ids is not None:
                 gen_kwargs["prompt_ids"] = prompt_ids
+            if anti_repeat:
+                # 환각 재시도: 같은 3-gram 금지 + 반복 페널티 (평소엔 끄는 이유: 정상 반복 표현까지 막는다)
+                gen_kwargs["no_repeat_ngram_size"] = 3
+                gen_kwargs["repetition_penalty"] = 1.3
             out = self._model.generate(**gen_kwargs)
         seqs = out["sequences"] if isinstance(out, dict) else out
         text = self._tok.batch_decode(seqs, skip_special_tokens=True)[0].strip()

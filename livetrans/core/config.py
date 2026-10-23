@@ -39,6 +39,10 @@ class SttConfig(BaseModel):
     )
     fallback: str | None = None  # 기본 엔진 로드 실패 시 쓸 엔진 (R-15)
     fallback_model: str = "large-v3"
+    rescue: str | None = (
+        None  # 환각 판정 시 그 발화만 다시 인식할 구조 엔진 (기본 엔진과 함께 로드, VRAM 추가)
+    )
+    rescue_model: str = "large-v3"
     device: str = "cuda"
     compute_type: str = "float16"
     beam_final: int = 5

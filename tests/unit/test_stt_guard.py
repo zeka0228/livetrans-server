@@ -35,3 +35,21 @@ def test_max_new_tokens_scales_with_duration():
     assert max_new_tokens_for(8000) == 136
     assert max_new_tokens_for(0) == 16
     assert max_new_tokens_for(60_000) == 440
+
+
+def test_phrase_repeat_and_salvage():
+    from livetrans.plugins.stt.guard import salvage_prefix
+
+    loop = "oh yeah i am i am i am i am i am i am i am"
+    assert hallucination_reason(loop).startswith("반복 구")
+    assert salvage_prefix(loop) == "oh yeah i am"
+    assert salvage_prefix("ok" * 100) == ""  # 살릴 앞부분이 없다
+    assert (
+        salvage_prefix(
+            "なにでがいでるのにかいでるのにかいでるのにかいでるのにかいでるのにかいでるのにか"
+        )
+        == "なにでがいでるのにか"
+    )
+    assert salvage_prefix("la li lu le lo " * 20) == "la li lu le lo"  # 구 반복: 단위 1개는 남긴다
+    assert salvage_prefix("정상 문장입니다") == ""
+    assert hallucination_reason("we came to shop we came to shop") is None  # 2회 반복은 정상

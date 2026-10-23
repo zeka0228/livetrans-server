@@ -41,7 +41,7 @@ from livetrans.plugins.diar.base import Diarizer
 from livetrans.plugins.source.base import Source
 from livetrans.plugins.source.loopback import CaptureError
 from livetrans.plugins.stt.base import STTEngine, Transcript
-from livetrans.plugins.stt.guard import hallucination_reason
+from livetrans.plugins.stt.guard import hallucination_reason, salvage_prefix
 
 log = logging.getLogger("livetrans.session")
 
@@ -95,6 +95,7 @@ class Session:
         src_lang: str | None,
         session_id: str | None = None,
         diarizer: Diarizer | None = None,
+        rescue_stt: STTEngine | None = None,
     ) -> None:
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.mode = mode
@@ -102,6 +103,7 @@ class Session:
         self.stt = stt
         self.source = source
         self.diarizer = diarizer
+        self.rescue_stt = rescue_stt  # 환각 판정 시 그 발화만 다시 인식 (없으면 살리기만)
         self._max_speakers_per_seg = settings.diar.max_speakers_per_seg
         # 캡처 소스는 control start 때 켠다 (그 전 소리는 받지 않음). 마이크는 앱이 보내는 대로 받는다.
         self._start_source_on_begin = mode == "B"
@@ -268,22 +270,101 @@ class Session:
                 pass
             self._log_file = None
 
-    def _guard(self, tr: Transcript, seg_id: int, kind: str) -> Transcript:
+    def _guard(self, tr: Transcript, seg_id: int, kind: str, outcome: str = "비움") -> Transcript:
         """환각(반복·저엔트로피) 텍스트는 비운다. 비운 문장은 프롬프트로도 쓰이지 않는다 (guard.py)."""
         why = hallucination_reason(tr.text)
         if why:
-            log.warning("환각 의심 %s seg=%s (%s): %r", kind, seg_id, why, tr.text[:80])
+            log.warning(
+                "환각 의심 %s seg=%s (%s) → %s: %r", kind, seg_id, why, outcome, tr.text[:80]
+            )
             self._log_line(
                 {
                     "type": "debug.hallucination",
                     "kind": kind,
                     "seg_id": seg_id,
                     "reason": why,
+                    "outcome": outcome,
                     "text": tr.text[:200],
                 }
             )
             tr.text, tr.words = "", []
         return tr
+
+    async def _recover_final(
+        self, seg: SpeechSegment, tr: Transcript, speaker: str | None, lang: str | None
+    ) -> tuple[Transcript, int]:
+        """확정 결과가 환각이면 복구 체인: ① 같은 엔진 반복 억제 재시도 ② 구조 엔진으로 화자 구간만 재인식 ③ 반복 직전까지 살리기.
+
+        돌려주는 Transcript 는 환각이 아니거나 빈 문장이다. 두 번째 값은 추가로 쓴 ms.
+        """
+        why = hallucination_reason(tr.text)
+        if not why:
+            return tr, 0
+        extra = 0
+        bad = tr.text
+        # ① 반복 억제 재시도 (같은 엔진, 같은 마스크)
+        try:
+            retry = await self.stt.transcribe(
+                seg, lang=lang, prompt=None, final=True, speaker=speaker, anti_repeat=True
+            )
+            extra += retry.latency_ms
+            if retry.text and not hallucination_reason(retry.text):
+                self._note_hallucination(seg.seg_id, why, bad, "재시도 성공")
+                return retry, extra
+        except Exception as e:  # noqa: BLE001
+            log.warning("환각 재시도 실패 seg=%s: %s", seg.seg_id, e)
+        # ② 구조 엔진: 화자가 있으면 그 화자가 말한 범위만 잘라서
+        if self.rescue_stt is not None:
+            sub = self._speaker_crop(seg, speaker)
+            try:
+                res = await self.rescue_stt.transcribe(sub, lang=lang, prompt=None, final=True)
+                extra += res.latency_ms
+                if res.text and not hallucination_reason(res.text):
+                    res.speaker = speaker
+                    self._note_hallucination(
+                        seg.seg_id, why, bad, f"구조 엔진 {self.rescue_stt.name}"
+                    )
+                    return res, extra
+            except Exception as e:  # noqa: BLE001
+                log.warning("구조 STT 실패 seg=%s: %s", seg.seg_id, e)
+        # ③ 반복 직전까지 살리기
+        kept = salvage_prefix(bad)
+        self._note_hallucination(seg.seg_id, why, bad, f"살림 {kept!r}" if kept else "비움")
+        tr.text, tr.words = kept, []
+        return tr, extra
+
+    def _note_hallucination(self, seg_id: int, why: str, text: str, outcome: str) -> None:
+        log.warning("환각 의심 final seg=%s (%s) → %s: %r", seg_id, why, outcome, text[:80])
+        self._log_line(
+            {
+                "type": "debug.hallucination",
+                "kind": "final",
+                "seg_id": seg_id,
+                "reason": why,
+                "outcome": outcome,
+                "text": text[:200],
+            }
+        )
+
+    @staticmethod
+    def _speaker_crop(seg: SpeechSegment, speaker: str | None) -> SpeechSegment:
+        """화자가 말한 범위(첫 시작~마지막 끝)만 잘라 낸 발화. 화자가 없으면 그대로."""
+        extent = speaker_extent(seg.speaker_turns, speaker) if speaker else None
+        if extent is None:
+            return seg
+        a, b = extent
+        i0 = max(0, (a - seg.t_start_ms) * 16)
+        i1 = min(len(seg.pcm), (b - seg.t_start_ms) * 16)
+        if i1 - i0 < 1600:  # 0.1 s 미만이면 자르지 않는다
+            return seg
+        return SpeechSegment(
+            seg_id=seg.seg_id,
+            t_start_ms=a,
+            t_end_ms=b,
+            pcm=seg.pcm[i0:i1],
+            forced_cut=seg.forced_cut,
+            prev_seg_id=seg.prev_seg_id,
+        )
 
     # --- 내부 ---
 
@@ -416,7 +497,8 @@ class Session:
                     stt_ms += tr.latency_ms
                 elif tr.lang_prob >= LANG_CONFIDENT:
                     self._lang_votes.append(tr.lang)
-            tr = self._guard(tr, seg.seg_id, "final")
+            tr, extra_ms = await self._recover_final(seg, tr, speaker, self.src_lang or tr.lang)
+            stt_ms += extra_ms
         except Exception as e:
             log.exception("final STT 실패 seg=%s speaker=%s", seg.seg_id, speaker)
             who = f" ({speaker})" if speaker else ""

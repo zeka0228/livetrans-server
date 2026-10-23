@@ -24,6 +24,9 @@ _MIN_BYTES_FOR_RATIO = 20
 
 _UNIT_REPEAT = re.compile(rf"(\S{{1,8}}?)\1{{{MIN_REPEATS - 1},}}")
 _WORD_REPEAT = re.compile(rf"(?:^|\s)(\S+)(?:\s+\1){{{MIN_WORD_REPEATS - 1},}}(?=\s|$)")
+# 여러 단어 구 반복: "i am i am i am i am" (1~6 단어 단위가 연속 4회 이상)
+_PHRASE_REPEAT = re.compile(r"(?:^|\s)(\S+(?:\s+\S+){0,5}?)(?:\s+\1){3,}(?=\s|$)")
+MIN_SALVAGE_CHARS = 4
 
 
 def compression_ratio(text: str) -> float:
@@ -33,22 +36,49 @@ def compression_ratio(text: str) -> float:
     return len(data) / len(zlib.compress(data))
 
 
+def _find_repeat(t: str) -> tuple[str, re.Match | None]:
+    for label, rx in (
+        ("반복 단위", _UNIT_REPEAT),
+        ("반복 단어", _WORD_REPEAT),
+        ("반복 구", _PHRASE_REPEAT),
+    ):
+        m = rx.search(t)
+        if m:
+            return label, m
+    return "", None
+
+
 def hallucination_reason(text: str) -> str | None:
     """환각으로 보이면 이유 문자열, 아니면 None."""
     t = text.strip()
     if not t:
         return None
-    m = _UNIT_REPEAT.search(t)
+    label, m = _find_repeat(t)
     if m:
-        return f"반복 단위 {m.group(1)!r}"
-    m = _WORD_REPEAT.search(t)
-    if m:
-        return f"반복 단어 {m.group(1)!r}"
+        return f"{label} {m.group(1)!r}"
     if len(t.encode("utf-8")) >= _MIN_BYTES_FOR_RATIO:
         ratio = compression_ratio(t)
         if ratio > COMPRESSION_RATIO_MAX:
             return f"압축비 {ratio:.1f}"
     return None
+
+
+def salvage_prefix(text: str) -> str:
+    """반복이 시작되기 전까지의 문장 + 반복 단위 1개. 살릴 만한 길이(4자)가 안 되면 빈 문자열.
+
+    'oh yeah i am i am i am …' → 'oh yeah i am', 'okokok…' → '' (버림). 압축비로만 걸린 문장은 반복 위치를 모르므로 버린다.
+    """
+    t = text.strip()
+    label, m = _find_repeat(t)
+    if not m:
+        return ""
+    prefix = t[: m.start()]
+    # 띄어쓰기 없는 글(일본어 등)에서 단위 반복이면 앞부분에 바로 이어 붙인다
+    sep = "" if (prefix and not prefix[-1].isspace() and label == "반복 단위") else " "
+    kept = (prefix.rstrip() + sep + m.group(1)).strip()
+    if len(kept.replace(" ", "")) < MIN_SALVAGE_CHARS or hallucination_reason(kept):
+        return ""
+    return kept
 
 
 def max_new_tokens_for(
