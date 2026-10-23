@@ -39,6 +39,8 @@ from livetrans.core.speaker import select_speakers, speaker_extent
 from livetrans.pipeline.lanes import LanePartial, LaneSegmenter, LaneUtterance
 from livetrans.pipeline.segmenter import PartialRequest, Segmenter, SpeechSegment
 from livetrans.plugins.diar.base import Diarizer
+from livetrans.plugins.mt import FallbackTranslator, load_glossary
+from livetrans.plugins.mt.base import Translation, TranslationError, Translator
 from livetrans.plugins.source.base import Source
 from livetrans.plugins.source.loopback import CaptureError
 from livetrans.plugins.stt.base import STTEngine, Transcript
@@ -95,14 +97,17 @@ class Session:
         *,
         mode: str,
         src_lang: str | None,
+        tgt_lang: str = "ko",
         session_id: str | None = None,
         diarizer: Diarizer | None = None,
         rescue_stt: STTEngine | None = None,
         stream_diarizer=None,
+        translator: Translator | None = None,
     ) -> None:
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.mode = mode
         self.src_lang = src_lang
+        self.tgt_lang = (tgt_lang or "ko").split("-")[0].lower()
         self.stt = stt
         self.source = source
         self.diarizer = diarizer
@@ -113,6 +118,12 @@ class Session:
         self._lanes: dict[str, LaneSegmenter] = {}
         self._lane_partials: dict[str, LanePartial] = {}
         self._next_seg_id = 0
+        # 번역 (명세 §4.4): 확정 자막마다 비동기로 번역해 translation.final. 화자별 문맥 쌍 유지
+        self.translator = translator
+        self._mt_cfg = settings.mt
+        self._mt_queue: asyncio.Queue[tuple[int, str | None, str, str] | None] = asyncio.Queue()
+        self._mt_context: dict[str | None, deque[tuple[str, str]]] = {}
+        self._glossary_cache: dict[str, dict[str, str]] = {}
         self._max_speakers_per_seg = settings.diar.max_speakers_per_seg
         # 캡처 소스는 control start 때 켠다 (그 전 소리는 받지 않음). 마이크는 앱이 보내는 대로 받는다.
         self._start_source_on_begin = mode == "B"
@@ -149,6 +160,7 @@ class Session:
         self._tasks = [
             asyncio.create_task(self._ingest_loop(), name=f"ingest-{self.session_id}"),
             asyncio.create_task(self._stt_loop(), name=f"stt-{self.session_id}"),
+            asyncio.create_task(self._mt_loop(), name=f"mt-{self.session_id}"),
         ]
         self._emit_state("starting")
 
@@ -422,6 +434,7 @@ class Session:
                 req, self._partial = self._partial, None
                 await self._run_partial(req)
             elif self._ingest_done:
+                self._mt_queue.put_nowait(None)  # STT 끝 → 번역 루프도 남은 것만 처리하고 끝낸다
                 return
             else:
                 await self._wake.wait()
@@ -495,6 +508,84 @@ class Session:
             speakers=(utt.speaker, *others),
             speaker_turns=turns,
         )
+
+    # --- 번역 (명세 §4.4) ---
+
+    async def _mt_loop(self) -> None:
+        while True:
+            item = await self._mt_queue.get()
+            if item is None:
+                return
+            seg_id, speaker, text, lang = item
+            await self._translate_one(seg_id, speaker, text, lang)
+
+    def _queue_translation(self, seg_id: int, speaker: str | None, text: str, lang: str) -> None:
+        if text:
+            self._mt_queue.put_nowait((seg_id, speaker, text, lang))
+
+    def _glossary(self, src: str) -> dict[str, str]:
+        key = f"{src}->{self.tgt_lang}"
+        if key not in self._glossary_cache:
+            self._glossary_cache[key] = load_glossary(self._mt_cfg.glossary, src, self.tgt_lang)
+        return self._glossary_cache[key]
+
+    async def _translate_one(self, seg_id: int, speaker: str | None, text: str, lang: str) -> None:
+        src = (lang or "").split("-")[0].lower()
+        if self.translator is None or not src or src == self.tgt_lang:
+            # 번역 엔진이 없거나 같은 언어: 원문을 그대로 (앱은 translation.final 이 있어야 줄이 완성된다)
+            tr = Translation(
+                seg_id, text, src or self.tgt_lang, self.tgt_lang, "passthrough", False, 0, speaker
+            )
+        else:
+            context = list(self._mt_context.get(speaker, ()))
+            glossary = self._glossary(src)
+            try:
+                if isinstance(self.translator, FallbackTranslator):
+                    tr = await self.translator.translate_full(
+                        seg_id,
+                        text,
+                        src=src,
+                        tgt=self.tgt_lang,
+                        context=context,
+                        glossary=glossary,
+                        speaker=speaker,
+                    )
+                else:
+                    t0 = asyncio.get_running_loop().time()
+                    out = await self.translator.translate(
+                        text, src=src, tgt=self.tgt_lang, context=context, glossary=glossary
+                    )
+                    tr = Translation(
+                        seg_id,
+                        out,
+                        src,
+                        self.tgt_lang,
+                        self.translator.name,
+                        False,
+                        int((asyncio.get_running_loop().time() - t0) * 1000),
+                        speaker,
+                    )
+            except TranslationError as e:
+                log.warning("번역 실패 seg=%s → 원문: %s", seg_id, e)
+                tr = Translation(seg_id, text, src, self.tgt_lang, "passthrough", True, 0, speaker)
+            except Exception:
+                log.exception("번역 오류 seg=%s", seg_id)
+                tr = Translation(seg_id, text, src, self.tgt_lang, "passthrough", True, 0, speaker)
+            if tr.text and tr.engine != "passthrough":
+                ctx = self._mt_context.setdefault(speaker, deque(maxlen=self._mt_cfg.context_pairs))
+                ctx.append((text, tr.text))
+        payload = {
+            "seg_id": tr.seg_id,
+            "text": tr.text,
+            "src_lang": tr.src_lang,
+            "tgt_lang": tr.tgt_lang,
+            "engine": tr.engine,
+            "fallback": tr.fallback,
+            "mt_ms": tr.latency_ms,
+        }
+        if speaker is not None:
+            payload["speaker"] = speaker
+        self._emit("translation.final", payload)
 
     # --- 중간 결과 ---
 
@@ -579,6 +670,7 @@ class Session:
                 "segment.final",
                 final_payload(seg, tr, stt_ms, speaker=shown, diar_ms=diar_ms),
             )
+            self._queue_translation(seg.seg_id, shown, tr.text, tr.lang)
 
     async def _attach_speakers(self, seg: SpeechSegment) -> int | None:
         """Diarizer 로 화자 구간을 받아 발화에 붙인다. 실패하면 화자 없이 진행 (경고만)."""
