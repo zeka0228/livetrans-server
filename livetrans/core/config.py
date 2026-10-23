@@ -54,10 +54,11 @@ class DiarConfig(BaseModel):
     device: str = "cuda"
     max_speakers: int = 4  # 세션당 화자 상한
     max_speakers_per_seg: int = 2  # 구간당 동시 화자 상한 k (명세 Q11)
-    match_threshold: float = (
-        0.5  # 기존 화자로 볼 코사인 하한 (pyannote LDA 공간), 실방송으로 재조정 필요
-    )
+    match_threshold: float = 0.6  # 기존 화자로 볼 코사인 하한 (pyannote LDA 공간). 합성음 측정 2026-10-23: 같은 화자 0.79, 다른 화자 0.14~0.56
     min_speaker_ms: int = 300  # 구간 안에서 이보다 짧게 말한 화자는 잡음으로 보고 버림
+    context_s: float = (
+        20.0  # 직전 발화를 이만큼 이어 붙여 함께 분할 (발화 하나만 넣으면 순차 2화자를 합침)
+    )
 
 
 def _default_tts_engines() -> dict[str, dict[str, Any]]:
