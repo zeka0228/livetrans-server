@@ -22,6 +22,7 @@ from livetrans.core.config import SttConfig
 from livetrans.core.gpu import GPU_LOCK
 from livetrans.pipeline.segmenter import SpeechSegment
 from livetrans.plugins.stt.base import Transcript
+from livetrans.plugins.stt.guard import max_new_tokens_for
 from livetrans.plugins.stt.stno import N_FRAMES_30S, build_stno_mask
 
 log = logging.getLogger("livetrans.stt.dicow")
@@ -113,10 +114,13 @@ class DiCoWSTT:
         prompt: str | None,
         final: bool,
         speaker: str | None = None,
+        anti_repeat: bool = False,
     ) -> Transcript:
         if self._model is None:
             raise RuntimeError("STT 모델이 로드되지 않았습니다")
-        return await asyncio.to_thread(self._transcribe_blocking, seg, lang, prompt, final, speaker)
+        return await asyncio.to_thread(
+            self._transcribe_blocking, seg, lang, prompt, final, speaker, anti_repeat
+        )
 
     def _transcribe_blocking(
         self,
@@ -125,6 +129,7 @@ class DiCoWSTT:
         prompt: str | None,
         final: bool,
         speaker: str | None,
+        anti_repeat: bool = False,
     ) -> Transcript:
         import torch
 
@@ -164,9 +169,15 @@ class DiCoWSTT:
                 "task": "transcribe",
                 "num_beams": self.cfg.beam_final if final else self.cfg.beam_partial,
                 "return_timestamps": False,
+                # 반복 환각이 토큰 상한(448)까지 달리지 않게 오디오 길이에 비례해 자른다 (guard.py)
+                "max_new_tokens": max_new_tokens_for(duration_ms),
             }
             if prompt_ids is not None:
                 gen_kwargs["prompt_ids"] = prompt_ids
+            if anti_repeat:
+                # 환각 재시도: 같은 3-gram 금지 + 반복 페널티 (평소엔 끄는 이유: 정상 반복 표현까지 막는다)
+                gen_kwargs["no_repeat_ngram_size"] = 3
+                gen_kwargs["repetition_penalty"] = 1.3
             out = self._model.generate(**gen_kwargs)
         seqs = out["sequences"] if isinstance(out, dict) else out
         text = self._tok.batch_decode(seqs, skip_special_tokens=True)[0].strip()

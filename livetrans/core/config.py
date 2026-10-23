@@ -39,6 +39,10 @@ class SttConfig(BaseModel):
     )
     fallback: str | None = None  # 기본 엔진 로드 실패 시 쓸 엔진 (R-15)
     fallback_model: str = "large-v3"
+    rescue: str | None = (
+        None  # 환각 판정 시 그 발화만 다시 인식할 구조 엔진 (기본 엔진과 함께 로드, VRAM 추가)
+    )
+    rescue_model: str = "large-v3"
     device: str = "cuda"
     compute_type: str = "float16"
     beam_final: int = 5
@@ -79,8 +83,13 @@ class TtsConfig(BaseModel):
 
 
 class LoggingConfig(BaseModel):
+    """세션 기록 (명세 §11). 기본값은 꺼짐 — 저장소 `default.yaml` 이 켠다 (테스트가 파일을 남기지 않게)."""
+
     dir: str = "logs"
-    per_session_jsonl: bool = True
+    per_session_jsonl: bool = False  # 세션마다 보낸 이벤트 전부를 logs/<날짜>_<세션>.jsonl 에
+    dump_audio: bool = (
+        False  # 확정 발화 PCM 을 logs/audio/<날짜>_<세션>/segNNNN.wav 로 (실패 사례 분석용)
+    )
 
 
 class Settings(BaseModel):

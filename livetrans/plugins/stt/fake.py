@@ -33,6 +33,7 @@ class FakeSTT:
         prompt: str | None,
         final: bool,
         speaker: str | None = None,
+        anti_repeat: bool = False,
     ) -> Transcript:
         self.calls.append(
             {
@@ -41,6 +42,10 @@ class FakeSTT:
                 "prompt": prompt,
                 "final": final,
                 "speaker": speaker,
+                "anti_repeat": anti_repeat,
+                "t_start_ms": seg.t_start_ms,
+                "t_end_ms": seg.t_end_ms,
+                "n_samples": len(seg.pcm),
             }
         )
         if self.latency_s:

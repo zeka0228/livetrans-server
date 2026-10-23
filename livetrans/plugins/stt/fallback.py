@@ -62,9 +62,10 @@ class FallbackSTT:
         prompt: str | None,
         final: bool,
         speaker: str | None = None,
+        anti_repeat: bool = False,
     ) -> Transcript:
         return await self.active.transcribe(
-            seg, lang=lang, prompt=prompt, final=final, speaker=speaker
+            seg, lang=lang, prompt=prompt, final=final, speaker=speaker, anti_repeat=anti_repeat
         )
 
     async def close(self) -> None:

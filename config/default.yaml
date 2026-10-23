@@ -16,6 +16,8 @@ stt:
   model: "BUT-FIT/DiCoW_v3_3" # dicow 가중치 (CC BY 4.0, THIRD_PARTY_NOTICES.md). 미리 받기: scripts/download_models.py
   fallback: faster_whisper    # 일본어 품질 문제 시 model 을 "kotoba-tech/kotoba-whisper-v2.0-faster" 로 바꿔 비교 (D-019)
   fallback_model: "large-v3"
+  rescue: faster_whisper      # 환각(반복 루프) 판정 시 그 발화만 다시 인식할 구조 엔진. DiCoW 마스크 디코딩이 반복에 자주 빠져서(ERR-008). VRAM +3 GB. 끄려면 null
+  rescue_model: large-v3
   device: "cuda"
   compute_type: "float16"
   beam_final: 5
@@ -43,5 +45,7 @@ tts:
   max_chars: 500
   cache_items: 128
 logging:
-  dir: "logs"
-  per_session_jsonl: true
+  dir: "logs"                 # gitignore. 세션 기록 (명세 §11)
+  per_session_jsonl: true     # 보낸 이벤트 전부 → logs/<날짜>_<세션>.jsonl (자막 오류 사례 수집)
+  dump_audio: false           # true 면 확정 발화 PCM 을 logs/audio/<날짜>_<세션>/segNNNN.wav 로 저장 — 오프라인 엔진 비교·화자 분할 분석용.
+                              #   개인 테스트 전용(방송 음성이 디스크에 남음), 분석이 끝나면 지울 것. default.local.yaml 에서 켠다.

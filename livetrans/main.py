@@ -13,7 +13,7 @@ from livetrans.api.capture import router as capture_router
 from livetrans.api.rest import router as rest_router
 from livetrans.api.sessions import router as sessions_router
 from livetrans.api.tts import router as tts_router
-from livetrans.core.config import Settings, load_settings
+from livetrans.core.config import Settings, SttConfig, load_settings
 from livetrans.core.gpu import prepare_cuda_dlls
 from livetrans.core.voices import VoiceRegistry
 from livetrans.plugins.diar import create_diarizer
@@ -68,6 +68,33 @@ async def _load_diarizer(
     return engine
 
 
+async def _load_rescue(settings: Settings, injected: STTEngine | None) -> STTEngine | None:
+    """환각 복구용 두 번째 STT. 실패해도 서버는 뜬다 (복구 없이 비운다)."""
+    stt = settings.stt
+    if injected is not None:
+        engine = injected
+    elif stt.rescue and stt.rescue not in (stt.engine, "none"):
+        engine = create_stt(
+            SttConfig(
+                **(
+                    stt.model_dump()
+                    | {"engine": stt.rescue, "model": stt.rescue_model, "fallback": None}
+                )
+            )
+        )
+    else:
+        return None
+    try:
+        await engine.load()
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "구조 STT %s(%s) 로드 실패 → 환각 복구 없이 진행: %s", engine.name, engine.model_id, e
+        )
+        return None
+    log.info("구조 STT 로드: %s (%s)", engine.name, engine.model_id)
+    return engine
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -76,6 +103,7 @@ def create_app(
     capture: CaptureBackend | None = None,
     tts_engines: dict[str, TTSEngine] | None = None,
     diar: DiarizerEngine | None = None,
+    stt_rescue: STTEngine | None = None,
 ) -> FastAPI:
     """stt·vad_factory·capture·tts_engines·diar 는 테스트에서 가짜를 주입할 때만 넘긴다."""
     settings = settings or load_settings()
@@ -90,6 +118,7 @@ def create_app(
         await engine.load()
         app.state.settings = settings
         app.state.stt = engine
+        app.state.stt_rescue = await _load_rescue(settings, stt_rescue)
         app.state.diar = await _load_diarizer(settings, diar)
         app.state.vad_factory = vad_factory or _silero_factory
         app.state.capture = capture or CaptureBackend()
@@ -101,6 +130,9 @@ def create_app(
         await voices.refresh()
         app.state.voices = voices
         app.state.models_loaded = [f"stt:{engine.name}:{engine.model_id}"]
+        if app.state.stt_rescue is not None:
+            r = app.state.stt_rescue
+            app.state.models_loaded.append(f"stt_rescue:{r.name}:{r.model_id}")
         if app.state.diar is not None:
             app.state.models_loaded.append(f"diar:{app.state.diar.name}:{app.state.diar.model_id}")
         app.state.models_loaded += [f"tts:{name}" for name in voices.engines]
@@ -109,6 +141,8 @@ def create_app(
         for session in list(app.state.sessions.values()):
             await session.abort()
         await engine.close()
+        if app.state.stt_rescue is not None:
+            await app.state.stt_rescue.close()
         if app.state.diar is not None:
             await app.state.diar.close()
         for tts in voices.engines.values():

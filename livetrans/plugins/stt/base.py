@@ -44,6 +44,7 @@ class STTEngine(Protocol):
         prompt: str | None,
         final: bool,
         speaker: str | None = None,
+        anti_repeat: bool = False,  # 환각 재시도: 반복 억제 디코딩 (지원 엔진만)
     ) -> Transcript: ...
 
     async def close(self) -> None: ...

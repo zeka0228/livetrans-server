@@ -17,10 +17,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
+import wave
 from collections import Counter, deque
 from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 
@@ -37,6 +41,7 @@ from livetrans.plugins.diar.base import Diarizer
 from livetrans.plugins.source.base import Source
 from livetrans.plugins.source.loopback import CaptureError
 from livetrans.plugins.stt.base import STTEngine, Transcript
+from livetrans.plugins.stt.guard import hallucination_reason, salvage_prefix
 
 log = logging.getLogger("livetrans.session")
 
@@ -90,6 +95,7 @@ class Session:
         src_lang: str | None,
         session_id: str | None = None,
         diarizer: Diarizer | None = None,
+        rescue_stt: STTEngine | None = None,
     ) -> None:
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.mode = mode
@@ -97,6 +103,7 @@ class Session:
         self.stt = stt
         self.source = source
         self.diarizer = diarizer
+        self.rescue_stt = rescue_stt  # 환각 판정 시 그 발화만 다시 인식 (없으면 살리기만)
         self._max_speakers_per_seg = settings.diar.max_speakers_per_seg
         # 캡처 소스는 control start 때 켠다 (그 전 소리는 받지 않음). 마이크는 앱이 보내는 대로 받는다.
         self._start_source_on_begin = mode == "B"
@@ -121,6 +128,9 @@ class Session:
         self._lang_votes: deque[str] = deque(maxlen=LANG_VOTES)
         self._tasks: list[asyncio.Task] = []
         self._stopping: asyncio.Task | None = None
+        self._log_file = None
+        self._dump_dir: Path | None = None
+        self._open_logs(settings.logging)
 
     # --- 수명 주기 ---
 
@@ -169,6 +179,7 @@ class Session:
             self._emit("error", error_payload("E_CAPTURE_LOST", lost, False))
         self._discard_speakers()
         self._emit_state("stopped")
+        self._close_logs()
 
     async def abort(self) -> None:
         """연결이 끊겨 결과를 받을 곳이 없을 때: 남은 작업을 버린다."""
@@ -178,10 +189,182 @@ class Session:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._discard_speakers()
         self.state = "stopped"
+        self._close_logs()
 
     @property
     def stopped(self) -> bool:
         return self.state == "stopped"
+
+    # --- 세션 기록 (명세 §11) ---
+
+    def _open_logs(self, cfg) -> None:
+        """이벤트 JSONL·발화 오디오 덤프 파일을 연다. 못 열면 경고만 남기고 기록 없이 간다."""
+        if not (cfg.per_session_jsonl or cfg.dump_audio):
+            return
+        stamp = f"{datetime.now():%Y%m%d}_{self.session_id}"
+        base = Path(cfg.dir)
+        try:
+            if cfg.per_session_jsonl:
+                base.mkdir(parents=True, exist_ok=True)
+                self._log_file = (base / f"{stamp}.jsonl").open("a", encoding="utf-8")
+            if cfg.dump_audio:
+                self._dump_dir = base / "audio" / stamp
+                self._dump_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:  # 디스크·권한 문제로 세션이 죽으면 안 된다
+            log.warning("세션 기록을 열 수 없음 (%s): %s", base, e)
+            self._log_file, self._dump_dir = None, None
+
+    def _log_line(self, record: dict) -> None:
+        if self._log_file is None:
+            return
+        try:
+            self._log_file.write(
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
+            self._log_file.flush()
+        except OSError as e:
+            log.warning("세션 기록 쓰기 실패: %s", e)
+            self._log_file = None
+
+    def _dump_segment(self, seg: SpeechSegment) -> None:
+        """확정 발화 PCM 을 WAV 로 남기고, 화자 구간과 함께 JSONL 에 적는다 (오프라인 엔진 비교·화자 분할 분석용)."""
+        if self._dump_dir is None:
+            return
+        path = self._dump_dir / f"seg{seg.seg_id:04d}.wav"
+        try:
+            pcm16 = (np.clip(seg.pcm, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+            with wave.open(str(path), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(pcm16)
+        except OSError as e:
+            log.warning("발화 덤프 실패 seg=%s: %s", seg.seg_id, e)
+            return
+        self._log_line(
+            {
+                "type": "debug.segment",
+                "seg_id": seg.seg_id,
+                "t_start_ms": seg.t_start_ms,
+                "t_end_ms": seg.t_end_ms,
+                "forced_cut": seg.forced_cut,
+                "file": str(path),
+                "speakers": list(seg.speakers),
+                "speaker_turns": [
+                    {
+                        "speaker": t.speaker,
+                        "t_start_ms": t.t_start_ms,
+                        "t_end_ms": t.t_end_ms,
+                        "overlap": t.overlap,
+                    }
+                    for t in seg.speaker_turns
+                ],
+            }
+        )
+
+    def _close_logs(self) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+            self._log_file = None
+
+    def _guard(self, tr: Transcript, seg_id: int, kind: str, outcome: str = "비움") -> Transcript:
+        """환각(반복·저엔트로피) 텍스트는 비운다. 비운 문장은 프롬프트로도 쓰이지 않는다 (guard.py)."""
+        why = hallucination_reason(tr.text)
+        if why:
+            log.warning(
+                "환각 의심 %s seg=%s (%s) → %s: %r", kind, seg_id, why, outcome, tr.text[:80]
+            )
+            self._log_line(
+                {
+                    "type": "debug.hallucination",
+                    "kind": kind,
+                    "seg_id": seg_id,
+                    "reason": why,
+                    "outcome": outcome,
+                    "text": tr.text[:200],
+                }
+            )
+            tr.text, tr.words = "", []
+        return tr
+
+    async def _recover_final(
+        self, seg: SpeechSegment, tr: Transcript, speaker: str | None, lang: str | None
+    ) -> tuple[Transcript, int]:
+        """확정 결과가 환각이면 복구 체인: ① 같은 엔진 반복 억제 재시도 ② 구조 엔진으로 화자 구간만 재인식 ③ 반복 직전까지 살리기.
+
+        돌려주는 Transcript 는 환각이 아니거나 빈 문장이다. 두 번째 값은 추가로 쓴 ms.
+        """
+        why = hallucination_reason(tr.text)
+        if not why:
+            return tr, 0
+        extra = 0
+        bad = tr.text
+        # ① 반복 억제 재시도 (같은 엔진, 같은 마스크)
+        try:
+            retry = await self.stt.transcribe(
+                seg, lang=lang, prompt=None, final=True, speaker=speaker, anti_repeat=True
+            )
+            extra += retry.latency_ms
+            if retry.text and not hallucination_reason(retry.text):
+                self._note_hallucination(seg.seg_id, why, bad, "재시도 성공")
+                return retry, extra
+        except Exception as e:  # noqa: BLE001
+            log.warning("환각 재시도 실패 seg=%s: %s", seg.seg_id, e)
+        # ② 구조 엔진: 화자가 있으면 그 화자가 말한 범위만 잘라서
+        if self.rescue_stt is not None:
+            sub = self._speaker_crop(seg, speaker)
+            try:
+                res = await self.rescue_stt.transcribe(sub, lang=lang, prompt=None, final=True)
+                extra += res.latency_ms
+                if res.text and not hallucination_reason(res.text):
+                    res.speaker = speaker
+                    self._note_hallucination(
+                        seg.seg_id, why, bad, f"구조 엔진 {self.rescue_stt.name}"
+                    )
+                    return res, extra
+            except Exception as e:  # noqa: BLE001
+                log.warning("구조 STT 실패 seg=%s: %s", seg.seg_id, e)
+        # ③ 반복 직전까지 살리기
+        kept = salvage_prefix(bad)
+        self._note_hallucination(seg.seg_id, why, bad, f"살림 {kept!r}" if kept else "비움")
+        tr.text, tr.words = kept, []
+        return tr, extra
+
+    def _note_hallucination(self, seg_id: int, why: str, text: str, outcome: str) -> None:
+        log.warning("환각 의심 final seg=%s (%s) → %s: %r", seg_id, why, outcome, text[:80])
+        self._log_line(
+            {
+                "type": "debug.hallucination",
+                "kind": "final",
+                "seg_id": seg_id,
+                "reason": why,
+                "outcome": outcome,
+                "text": text[:200],
+            }
+        )
+
+    @staticmethod
+    def _speaker_crop(seg: SpeechSegment, speaker: str | None) -> SpeechSegment:
+        """화자가 말한 범위(첫 시작~마지막 끝)만 잘라 낸 발화. 화자가 없으면 그대로."""
+        extent = speaker_extent(seg.speaker_turns, speaker) if speaker else None
+        if extent is None:
+            return seg
+        a, b = extent
+        i0 = max(0, (a - seg.t_start_ms) * 16)
+        i1 = min(len(seg.pcm), (b - seg.t_start_ms) * 16)
+        if i1 - i0 < 1600:  # 0.1 s 미만이면 자르지 않는다
+            return seg
+        return SpeechSegment(
+            seg_id=seg.seg_id,
+            t_start_ms=a,
+            t_end_ms=b,
+            pcm=seg.pcm[i0:i1],
+            forced_cut=seg.forced_cut,
+            prev_seg_id=seg.prev_seg_id,
+        )
 
     # --- 내부 ---
 
@@ -191,7 +374,9 @@ class Session:
             self.diarizer.reset()
 
     def _emit(self, type_: str, payload: dict) -> None:
-        self.outbox.put_nowait(self.events.make(type_, payload))
+        env = self.events.make(type_, payload)
+        self.outbox.put_nowait(env)
+        self._log_line(env.to_dict())
 
     def _emit_state(self, state: str) -> None:
         self.state = state
@@ -241,6 +426,7 @@ class Session:
         except Exception as e:  # noqa: BLE001 — 중간 결과 실패는 경고만 남기고 넘긴다
             log.warning("partial STT 실패 seg=%s: %s", req.seg_id, e)
             return
+        tr = self._guard(tr, req.seg_id, "partial")
         # 인식하는 동안 같은 발화의 확정 결과가 먼저 나갔으면 보내지 않는다
         if req.seg_id <= self._last_final_id or not tr.text:
             return
@@ -251,6 +437,7 @@ class Session:
 
     async def _run_final(self, seg: SpeechSegment) -> None:
         diar_ms = await self._attach_speakers(seg)
+        self._dump_segment(seg)
         # 화자 마스크를 지원하는 엔진이면 화자마다 1회, 아니면 구간 전체 1회 (주 화자만 표시)
         if seg.speakers and getattr(self.stt, "supports_speaker_mask", False):
             targets: list[str | None] = list(seg.speakers)
@@ -310,6 +497,8 @@ class Session:
                     stt_ms += tr.latency_ms
                 elif tr.lang_prob >= LANG_CONFIDENT:
                     self._lang_votes.append(tr.lang)
+            tr, extra_ms = await self._recover_final(seg, tr, speaker, self.src_lang or tr.lang)
+            stt_ms += extra_ms
         except Exception as e:
             log.exception("final STT 실패 seg=%s speaker=%s", seg.seg_id, speaker)
             who = f" ({speaker})" if speaker else ""
