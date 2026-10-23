@@ -49,6 +49,20 @@ def _lower_uppercase_mapping(tokenizer) -> None:
                 tokenizer.upper_cased_tokens[lower_index] = index
 
 
+def strip_prompt_echo(text: str, prompt: str | None) -> str:
+    """일부 경로에서 프롬프트가 출력 앞에 그대로 붙어 나오면 떼어낸다.
+
+    출력이 프롬프트와 **똑같기만** 하면 떼지 않는다 — 같은 문장을 실제로 또 말한 것일 수 있다 (합성음 E2E 에서 영어 문장이
+    통째로 지워진 사례). 짧은 발화의 되풀이는 세션의 반복 규칙이 따로 거른다.
+    """
+    if not prompt:
+        return text
+    head = prompt[-PROMPT_MAX_CHARS:].strip()
+    if head and len(text) > len(head) and text.startswith(head):
+        return text[len(head) :].strip()
+    return text
+
+
 class DiCoWSTT:
     name = "dicow"
     languages = ("ko", "en", "ja")
@@ -180,10 +194,9 @@ class DiCoWSTT:
                 gen_kwargs["repetition_penalty"] = 1.3
             out = self._model.generate(**gen_kwargs)
         seqs = out["sequences"] if isinstance(out, dict) else out
-        text = self._tok.batch_decode(seqs, skip_special_tokens=True)[0].strip()
-        if prompt and text.startswith(prompt[-PROMPT_MAX_CHARS:].strip()):
-            # 일부 경로에서 프롬프트가 출력 앞에 그대로 붙어 나오면 떼어낸다
-            text = text[len(prompt[-PROMPT_MAX_CHARS:].strip()) :].strip()
+        text = strip_prompt_echo(
+            self._tok.batch_decode(seqs, skip_special_tokens=True)[0].strip(), prompt
+        )
         return Transcript(
             seg_id=seg.seg_id,
             text=text,

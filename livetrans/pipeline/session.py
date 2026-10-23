@@ -36,6 +36,7 @@ from livetrans.core.events import (
     session_state_payload,
 )
 from livetrans.core.speaker import select_speakers, speaker_extent
+from livetrans.pipeline.lanes import LanePartial, LaneSegmenter, LaneUtterance
 from livetrans.pipeline.segmenter import PartialRequest, Segmenter, SpeechSegment
 from livetrans.plugins.diar.base import Diarizer
 from livetrans.plugins.source.base import Source
@@ -49,6 +50,7 @@ PARTIAL_INTERVAL_S = 1.0
 LANG_CONFIDENT = 0.7  # 자동 감지 확률이 이보다 낮으면 최근 다수결 언어로 다시 인식 (§4.3)
 LANG_VOTES = 10
 LANG_MIN_VOTES = 3
+REPEAT_SUPPRESS_MAX_MS = 1500  # 직전 문장과 같은 결과를 비우는 발화 길이 상한
 
 
 def final_payload(
@@ -96,6 +98,7 @@ class Session:
         session_id: str | None = None,
         diarizer: Diarizer | None = None,
         rescue_stt: STTEngine | None = None,
+        stream_diarizer=None,
     ) -> None:
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.mode = mode
@@ -104,6 +107,12 @@ class Session:
         self.source = source
         self.diarizer = diarizer
         self.rescue_stt = rescue_stt  # 환각 판정 시 그 발화만 다시 인식 (없으면 살리기만)
+        # D-028 스트림 모드: 연속 오디오 화자 분할 + 화자 레인. 있으면 VAD 세그먼터 대신 레인이 발화를 자른다
+        self.stream = stream_diarizer
+        self._vad_cfg = settings.vad
+        self._lanes: dict[str, LaneSegmenter] = {}
+        self._lane_partials: dict[str, LanePartial] = {}
+        self._next_seg_id = 0
         self._max_speakers_per_seg = settings.diar.max_speakers_per_seg
         # 캡처 소스는 control start 때 켠다 (그 전 소리는 받지 않음). 마이크는 앱이 보내는 대로 받는다.
         self._start_source_on_begin = mode == "B"
@@ -121,11 +130,11 @@ class Session:
         self._partial: PartialRequest | None = None
         self._wake = asyncio.Event()
         self._ingest_done = False
-        self._last_final_id = -1
+        self._final_done: set[int] = set()  # 확정을 보낸 seg_id (중간 결과 억제용)
         self._prev_text: dict[
             str | None, str
         ] = {}  # 화자별 직전 확정 문장 (프롬프트·반복 제거, §4.3)
-        self._lang_votes: deque[str] = deque(maxlen=LANG_VOTES)
+        self._lang_votes: dict[str | None, deque[str]] = {}  # 화자별 최근 감지 언어 (다수결 힌트)
         self._tasks: list[asyncio.Task] = []
         self._stopping: asyncio.Task | None = None
         self._log_file = None
@@ -369,9 +378,11 @@ class Session:
     # --- 내부 ---
 
     def _discard_speakers(self) -> None:
-        """세션 종료: 화자 임베딩 폐기 (§13)."""
+        """세션 종료: 화자 임베딩·문맥 오디오 폐기 (§13)."""
         if self.diarizer is not None:
             self.diarizer.reset()
+        if self.stream is not None:
+            self.stream.reset()
 
     def _emit(self, type_: str, payload: dict) -> None:
         env = self.events.make(type_, payload)
@@ -383,14 +394,17 @@ class Session:
         self._emit("session.state", session_state_payload(state, delay_s=None))
 
     async def _ingest_loop(self) -> None:
-        async for frame in self.source.frames():
-            for ev in self.segmenter.push(frame.pcm):
-                if isinstance(ev, SpeechSegment):
-                    self._finals.append(ev)
-                else:
-                    self._partial = ev
-            self._wake.set()
-        self._finals.extend(self.segmenter.flush())
+        if self.stream is not None:
+            await self._ingest_stream()
+        else:
+            async for frame in self.source.frames():
+                for ev in self.segmenter.push(frame.pcm):
+                    if isinstance(ev, SpeechSegment):
+                        self._finals.append(ev)
+                    else:
+                        self._partial = ev
+                self._wake.set()
+            self._finals.extend(self.segmenter.flush())
         self._ingest_done = True
         self._wake.set()
         if getattr(self.source, "lost_reason", None) and self._stopping is None:
@@ -401,6 +415,9 @@ class Session:
         while True:
             if self._finals:
                 await self._run_final(self._finals.popleft())
+            elif self._lane_partials:
+                speaker = next(iter(self._lane_partials))
+                await self._run_partial(self._lane_partials.pop(speaker))
             elif self._partial is not None:
                 req, self._partial = self._partial, None
                 await self._run_partial(req)
@@ -410,37 +427,140 @@ class Session:
                 await self._wake.wait()
                 self._wake.clear()
 
-    async def _run_partial(self, req: PartialRequest) -> None:
-        if req.seg_id <= self._last_final_id:
+    # --- 스트림 모드 (D-028) ---
+
+    def _alloc_seg_id(self) -> int:
+        seg_id = self._next_seg_id
+        self._next_seg_id += 1
+        return seg_id
+
+    async def _ingest_stream(self) -> None:
+        sd = self.stream
+        async for frame in self.source.frames():
+            sd.push(frame.pcm)
+            if sd.ready:
+                await self._stream_step(final=False)
+        await self._stream_step(final=True)
+        for lane in self._lanes.values():
+            for utt in lane.flush():
+                self._finals.append(self._lane_segment(utt))
+        self._lane_partials.clear()
+        self._wake.set()
+
+    async def _stream_step(self, *, final: bool) -> None:
+        sd = self.stream
+        try:
+            turns = await sd.step(final=final)
+        except Exception as e:  # noqa: BLE001 — 화자 분할이 죽어도 세션은 유지 (이 창은 건너뜀)
+            log.warning("스트리밍 화자 분할 실패: %s", e)
             return
-        seg = SpeechSegment(
-            seg_id=req.seg_id,
-            t_start_ms=req.t_start_ms,
-            t_end_ms=req.t_start_ms + len(req.pcm) * 1000 // 16000,
-            pcm=req.pcm,
+        by_speaker: dict[str, list[tuple[int, int]]] = {}
+        for t in turns:
+            by_speaker.setdefault(t.speaker, []).append((t.t_start_ms, t.t_end_ms))
+        committed = sd.committed_ms
+        for speaker in set(by_speaker) | set(self._lanes):
+            lane = self._lanes.get(speaker)
+            if lane is None:
+                lane = self._lanes[speaker] = LaneSegmenter(
+                    speaker, self._vad_cfg, self._alloc_seg_id
+                )
+            for utt in lane.push(by_speaker.get(speaker, []), committed):
+                self._finals.append(self._lane_segment(utt))
+            span = lane.open_span
+            if span is not None and not final:
+                seg_id, a, b = span
+                self._lane_partials[speaker] = LanePartial(
+                    seg_id=seg_id,
+                    speaker=speaker,
+                    t_start_ms=a,
+                    t_end_ms=b,
+                    pcm=sd.audio(a, b),
+                    turns=sd.committed_turns(a, b),
+                )
+        self._wake.set()
+
+    def _lane_segment(self, utt: LaneUtterance) -> SpeechSegment:
+        """레인 발화 → STT 입력. 다른 화자의 겹친 구간도 함께 넣어 화자 마스크가 서게 한다."""
+        turns = self.stream.committed_turns(utt.t_start_ms, utt.t_end_ms)
+        if not any(t.speaker == utt.speaker for t in turns):
+            turns = utt.turns + turns
+        others = tuple(sorted({t.speaker for t in turns if t.speaker != utt.speaker}))
+        return SpeechSegment(
+            seg_id=utt.seg_id,
+            t_start_ms=utt.t_start_ms,
+            t_end_ms=utt.t_end_ms,
+            pcm=self.stream.audio(utt.t_start_ms, utt.t_end_ms),
+            forced_cut=utt.forced_cut,
+            prev_seg_id=utt.prev_seg_id,
+            speakers=(utt.speaker, *others),
+            speaker_turns=turns,
         )
+
+    # --- 중간 결과 ---
+
+    async def _run_partial(self, req: PartialRequest | LanePartial) -> None:
+        if req.seg_id in self._final_done:
+            return
+        speaker = getattr(req, "speaker", None)
+        if isinstance(req, LanePartial):
+            others = tuple(sorted({t.speaker for t in req.turns if t.speaker != speaker}))
+            seg = SpeechSegment(
+                seg_id=req.seg_id,
+                t_start_ms=req.t_start_ms,
+                t_end_ms=req.t_end_ms,
+                pcm=req.pcm,
+                speakers=(speaker, *others),
+                speaker_turns=req.turns,
+            )
+        else:
+            seg = SpeechSegment(
+                seg_id=req.seg_id,
+                t_start_ms=req.t_start_ms,
+                t_end_ms=req.t_start_ms + len(req.pcm) * 1000 // 16000,
+                pcm=req.pcm,
+            )
+        if len(seg.pcm) < 1600:  # 0.1 s 미만은 돌리지 않는다
+            return
+        mask = speaker if getattr(self.stt, "supports_speaker_mask", False) else None
         try:
             tr = await self.stt.transcribe(
-                seg, lang=self._lang_hint(), prompt=self._prev_text.get(None) or None, final=False
+                seg,
+                lang=self._lang_hint(speaker),
+                prompt=self._prev_text.get(speaker) or None,
+                final=False,
+                speaker=mask,
             )
         except Exception as e:  # noqa: BLE001 — 중간 결과 실패는 경고만 남기고 넘긴다
             log.warning("partial STT 실패 seg=%s: %s", req.seg_id, e)
             return
         tr = self._guard(tr, req.seg_id, "partial")
         # 인식하는 동안 같은 발화의 확정 결과가 먼저 나갔으면 보내지 않는다
-        if req.seg_id <= self._last_final_id or not tr.text:
+        if req.seg_id in self._final_done or not tr.text:
             return
-        self._emit(
-            "segment.partial",
-            {"seg_id": req.seg_id, "t_start_ms": req.t_start_ms, "text": tr.text, "lang": tr.lang},
-        )
+        payload = {
+            "seg_id": req.seg_id,
+            "t_start_ms": req.t_start_ms,
+            "text": tr.text,
+            "lang": tr.lang,
+        }
+        if speaker is not None:
+            payload["speaker"] = speaker
+        self._emit("segment.partial", payload)
 
     async def _run_final(self, seg: SpeechSegment) -> None:
-        diar_ms = await self._attach_speakers(seg)
+        if self.stream is not None:
+            diar_ms = self.stream.last_latency_ms  # 레인 발화는 화자가 이미 정해져 있다
+        else:
+            diar_ms = await self._attach_speakers(seg)
         self._dump_segment(seg)
-        # 화자 마스크를 지원하는 엔진이면 화자마다 1회, 아니면 구간 전체 1회 (주 화자만 표시)
-        if seg.speakers and getattr(self.stt, "supports_speaker_mask", False):
-            targets: list[str | None] = list(seg.speakers)
+        if self.stream is not None:
+            # 레인 발화: 이 레인의 화자 1명만 인식 (다른 화자는 마스크로만 쓴다)
+            targets: list[str | None] = [
+                seg.speakers[0] if getattr(self.stt, "supports_speaker_mask", False) else None
+            ]
+        elif seg.speakers and getattr(self.stt, "supports_speaker_mask", False):
+            # 화자 마스크를 지원하는 엔진이면 화자마다 1회, 아니면 구간 전체 1회 (주 화자만 표시)
+            targets = list(seg.speakers)
         else:
             targets = [None]
         results: list[tuple[str | None, Transcript, int]] = []
@@ -448,7 +568,7 @@ class Session:
             got = await self._transcribe_final(seg, speaker)
             if got is not None:
                 results.append((speaker, *got))
-        self._last_final_id = max(self._last_final_id, seg.seg_id)
+        self._final_done.add(seg.seg_id)
         if not results:
             return
         # 화자별 결과 중 빈 문장은 빼되, 전부 비었으면 하나는 보낸다 (앱이 같은 seg_id 의 partial 을 지울 수 있게)
@@ -489,14 +609,14 @@ class Session:
             )
             stt_ms = tr.latency_ms
             if self.src_lang is None:
-                majority = self._majority_lang()
+                majority = self._majority_lang(speaker)
                 if tr.lang_prob < LANG_CONFIDENT and majority and majority != tr.lang:
                     tr = await self.stt.transcribe(
                         seg, lang=majority, prompt=prompt, final=True, speaker=speaker
                     )
                     stt_ms += tr.latency_ms
                 elif tr.lang_prob >= LANG_CONFIDENT:
-                    self._lang_votes.append(tr.lang)
+                    self._lang_votes.setdefault(speaker, deque(maxlen=LANG_VOTES)).append(tr.lang)
             tr, extra_ms = await self._recover_final(seg, tr, speaker, self.src_lang or tr.lang)
             stt_ms += extra_ms
         except Exception as e:
@@ -507,8 +627,13 @@ class Session:
                 error_payload("E_STT_FAILED", f"발화 {seg.seg_id}{who} 인식 실패: {e}", True),
             )
             return None
-        # 환각 방지: 같은 화자의 직전과 똑같은 문장 반복은 비운다 (§4.3)
-        if tr.text and tr.text == self._prev_text.get(speaker):
+        # 환각 방지: 같은 화자의 직전과 똑같은 문장이 **짧은 발화**에서 또 나오면 프롬프트 되풀이로 보고 비운다 (§4.3).
+        # 긴 발화는 실제로 같은 말을 반복한 것일 수 있어 남긴다 (합성음 E2E 에서 3.5 s 문장이 사라진 사례)
+        if (
+            tr.text
+            and tr.text == self._prev_text.get(speaker)
+            and seg.t_end_ms - seg.t_start_ms <= REPEAT_SUPPRESS_MAX_MS
+        ):
             tr.text, tr.words = "", []
         if tr.text:
             self._prev_text[speaker] = tr.text
@@ -516,10 +641,14 @@ class Session:
                 self._prev_text[None] = tr.text  # 중간 결과 프롬프트용 (화자 무관 최신 문장)
         return tr, stt_ms
 
-    def _majority_lang(self) -> str | None:
-        if len(self._lang_votes) < LANG_MIN_VOTES:
+    def _majority_lang(self, speaker: str | None = None) -> str | None:
+        """그 화자의 최근 확정 언어 다수결 (화자가 없으면 전체). 투표가 적으면 None."""
+        votes = self._lang_votes.get(speaker)
+        if votes is None and speaker is None:
+            votes = deque(v for d in self._lang_votes.values() for v in d)
+        if not votes or len(votes) < LANG_MIN_VOTES:
             return None
-        return Counter(self._lang_votes).most_common(1)[0][0]
+        return Counter(votes).most_common(1)[0][0]
 
-    def _lang_hint(self) -> str | None:
-        return self.src_lang or self._majority_lang()
+    def _lang_hint(self, speaker: str | None = None) -> str | None:
+        return self.src_lang or self._majority_lang(speaker)
