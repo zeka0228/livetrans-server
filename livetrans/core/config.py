@@ -54,6 +54,10 @@ class DiarConfig(BaseModel):
     """화자 분할 (명세 §4.8, D-021). `engine: none` 이면 화자 없이 동작한다."""
 
     engine: str = "none"  # none | pyannote
+    mode: str = "stream"  # stream: 연속 오디오 + 긴 창 + 화자 레인 (D-028) | utterance: 발화 단위 + 문맥 창 (D-027)
+    window_s: float = 120.0  # stream: 창 길이 (실방송 시뮬레이션 120 s = 오프라인 대비 98.2 % 일치)
+    hop_s: float = 3.0  # stream: 창 실행 간격
+    right_context_s: float = 2.0  # stream: 확정을 미루는 오른쪽 문맥 (C_diar)
     model: str = "pyannote/speaker-diarization-community-1"
     device: str = "cuda"
     max_speakers: int = 4  # 세션당 화자 상한

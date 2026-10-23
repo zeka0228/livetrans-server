@@ -53,3 +53,12 @@ def test_phrase_repeat_and_salvage():
     assert salvage_prefix("la li lu le lo " * 20) == "la li lu le lo"  # 구 반복: 단위 1개는 남긴다
     assert salvage_prefix("정상 문장입니다") == ""
     assert hallucination_reason("we came to shop we came to shop") is None  # 2회 반복은 정상
+
+
+def test_prompt_echo_is_stripped_only_when_output_is_longer_than_prompt():
+    from livetrans.plugins.stt.dicow import strip_prompt_echo
+
+    assert strip_prompt_echo("직전 문장 새 문장", "직전 문장") == "새 문장"
+    assert strip_prompt_echo("직전 문장", "직전 문장") == "직전 문장"  # 똑같이 또 말한 것일 수 있다
+    assert strip_prompt_echo("다른 문장", "직전 문장") == "다른 문장"
+    assert strip_prompt_echo("문장", None) == "문장"

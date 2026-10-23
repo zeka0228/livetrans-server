@@ -103,6 +103,19 @@ class PyannoteDiarizerEngine:
         )
         return PyannoteDiarizer(self._pipe, self.cfg, registry)
 
+    def create_stream(self):
+        """스트리밍 화자 분할기 (D-028). 같은 파이프라인을 연속 오디오 창에 쓴다."""
+        from livetrans.plugins.diar.stream import StreamDiarizer
+
+        if self._pipe is None:
+            raise RuntimeError("화자 분할 모델이 로드되지 않았습니다")
+        registry = SpeakerRegistry(
+            threshold=self.cfg.match_threshold,
+            max_speakers=self.cfg.max_speakers,
+            transform=self._transform,
+        )
+        return StreamDiarizer(self._pipe, self.cfg, registry)
+
     async def close(self) -> None:
         self._pipe = None
         self._transform = None

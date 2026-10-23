@@ -24,6 +24,10 @@ stt:
   beam_partial: 1
   language: null              # null = 자동 감지, 또는 "ko" | "en" | "ja"
 diar:
+  mode: stream                # stream = 연속 오디오 + 120 s 창 + 화자 레인 (D-028, 자막이 화자가 말을 멈춘 뒤 약 3~6 s 에 확정) | utterance = 발화 단위 (D-027)
+  window_s: 120               # stream 창 길이(초). 실방송 시뮬레이션: 120 s 98.2 % 일치, 60 s 이하 ~70 %
+  hop_s: 3                    # stream 창 실행 간격(초). 창당 ≈ 0.6 s GPU → 점유 ≈ 20 %
+  right_context_s: 2          # stream 확정을 미루는 오른쪽 문맥(초)
   engine: none                # none | pyannote  (D-021). 앱이 API 계약 S-17(speaker 필드)을 반영하기 전까지 기본 none.
                               # 켜려면 default.local.yaml 에 diar: {engine: pyannote}. 모델은 HF 이용 조건 동의 + 토큰 필요:
                               #   scripts/download_models.py --diar  (토큰은 hf auth login 또는 HF_TOKEN)

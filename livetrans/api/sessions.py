@@ -58,6 +58,20 @@ def _sessions(app) -> dict[str, Session]:
     return app.state.sessions
 
 
+def _diarizer_kwargs(app) -> dict:
+    """화자 분할 설정에 따라 세션에 넘길 분할기: stream(D-028) 이면 스트리밍, 아니면 발화 단위 (D-027)."""
+    engine = app.state.diar
+    if engine is None:
+        return {}
+    mode = app.state.settings.diar.mode
+    if mode == "stream" and hasattr(engine, "create_stream"):
+        try:
+            return {"stream_diarizer": engine.create_stream()}
+        except NotImplementedError:
+            pass  # 스트림을 지원하지 않는 엔진 → 발화 단위
+    return {"diarizer": engine.create()}
+
+
 @router.post("/api/sessions")
 async def create_session(body: SessionCreate, request: Request) -> dict:
     app = request.app
@@ -81,8 +95,8 @@ async def create_session(body: SessionCreate, request: Request) -> dict:
         source,
         mode=body.mode,
         src_lang=None if body.src_lang in (None, "auto") else body.src_lang,
-        diarizer=app.state.diar.create() if app.state.diar is not None else None,
         rescue_stt=getattr(app.state, "stt_rescue", None),
+        **_diarizer_kwargs(app),
     )
     await session.start()
     _sessions(app)[session.session_id] = session
