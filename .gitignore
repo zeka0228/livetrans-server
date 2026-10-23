@@ -31,3 +31,4 @@ tools/wincap/out/
 
 # 모델 가중치 (scripts/download_models.py 가 받음, 저장소에 넣지 않음 — 권리 원칙 3)
 models/
+runtime/

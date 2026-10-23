@@ -34,6 +34,21 @@ def prepare_cuda_dlls() -> list[Path]:
     return added
 
 
+def gpu_util() -> float | None:
+    """첫 GPU 의 사용률(0~1). NVML 을 못 쓰면 None."""
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            h = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return pynvml.nvmlDeviceGetUtilizationRates(h).gpu / 100.0
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def gpu_info() -> dict[str, Any] | None:
     """첫 번째 GPU 의 이름·메모리(MB). NVML 을 못 쓰면 None."""
     try:

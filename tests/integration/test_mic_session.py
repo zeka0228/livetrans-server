@@ -80,9 +80,16 @@ def test_create_session_response_shape(client):
 
 
 def test_unsupported_mode_returns_501(client):
-    r = client.post("/api/sessions", json={"mode": "A", "source": {"type": "obs_stream"}})
+    r = client.post("/api/sessions", json={"mode": "D", "source": {"type": "obs_stream"}})
     assert r.status_code == 501
     assert r.json()["detail"]["code"] == "E_NOT_IMPLEMENTED"
+
+
+def test_mode_a_without_url_is_400_or_501(client):
+    r = client.post("/api/sessions", json={"mode": "A", "source": {"type": "obs_stream"}})
+    # ffmpeg 가 있으면 url 누락(400), 없으면 모드 A 미지원(501)
+    assert r.status_code in (400, 501)
+    assert r.json()["detail"]["code"] in ("E_SOURCE_PARAM", "E_NOT_IMPLEMENTED")
 
 
 def test_mic_flow_emits_finals_and_flushes_on_stop(client):

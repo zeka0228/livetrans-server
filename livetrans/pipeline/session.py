@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
+import time
 import uuid
 import wave
 from collections import Counter, deque
@@ -28,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
+from livetrans.core.audio import OUT_RATE, resample_linear
 from livetrans.core.config import Settings
 from livetrans.core.events import (
     Envelope,
@@ -35,9 +38,11 @@ from livetrans.core.events import (
     error_payload,
     session_state_payload,
 )
+from livetrans.core.gpu import gpu_info, gpu_util
 from livetrans.core.speaker import select_speakers, speaker_extent
 from livetrans.pipeline.lanes import LanePartial, LaneSegmenter, LaneUtterance
 from livetrans.pipeline.segmenter import PartialRequest, Segmenter, SpeechSegment
+from livetrans.pipeline.timeline import Composer, DeadlineEvent, OutputRing, Timeline
 from livetrans.plugins.diar.base import Diarizer
 from livetrans.plugins.mt import FallbackTranslator, load_glossary
 from livetrans.plugins.mt.base import Translation, TranslationError, Translator
@@ -87,6 +92,16 @@ def final_payload(
     return payload
 
 
+def _wav_to_float(data: bytes) -> tuple[np.ndarray, int]:
+    """16-bit mono WAV 바이트 → (float32, sample_rate)."""
+    with wave.open(io.BytesIO(data)) as w:
+        sr = w.getframerate()
+        pcm = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+        if w.getnchannels() > 1:
+            pcm = pcm.reshape(-1, w.getnchannels()).mean(axis=1)
+    return pcm, sr
+
+
 class Session:
     def __init__(
         self,
@@ -103,6 +118,12 @@ class Session:
         rescue_stt: STTEngine | None = None,
         stream_diarizer=None,
         translator: Translator | None = None,
+        delay_s: float | None = None,
+        hls_writer=None,
+        voices=None,
+        tts_enabled: bool = False,
+        tts_voice_ref: str | None = None,
+        show_speaker: bool = True,
     ) -> None:
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.mode = mode
@@ -121,12 +142,43 @@ class Session:
         # 번역 (명세 §4.4): 확정 자막마다 비동기로 번역해 translation.final. 화자별 문맥 쌍 유지
         self.translator = translator
         self._mt_cfg = settings.mt
-        self._mt_queue: asyncio.Queue[tuple[int, str | None, str, str] | None] = asyncio.Queue()
+        self._mt_queue: asyncio.Queue[tuple[int, str | None, str, str, int, int] | None] = (
+            asyncio.Queue()
+        )
         self._mt_context: dict[str | None, deque[tuple[str, str]]] = {}
         self._glossary_cache: dict[str, dict[str, str]] = {}
         self._max_speakers_per_seg = settings.diar.max_speakers_per_seg
-        # 캡처 소스는 control start 때 켠다 (그 전 소리는 받지 않음). 마이크는 앱이 보내는 대로 받는다.
-        self._start_source_on_begin = mode == "B"
+        # 캡처·스트림 소스는 control start 때 켠다 (그 전 소리는 받지 않음). 마이크는 앱이 보내는 대로 받는다.
+        self._start_source_on_begin = mode in ("A", "B")
+        # 모드 A (명세 §3·§4.5): 지연 타임라인 + 원본 링버퍼 + 컴포저 + HLS
+        self.delay_s = delay_s if mode == "A" else None
+        self.hls = hls_writer
+        self.voices = voices
+        self.tts_enabled = tts_enabled and voices is not None
+        self.tts_voice_ref = tts_voice_ref
+        self.show_speaker = show_speaker
+        self._tl_cfg = settings.timeline
+        self._tts_cfg = settings.tts
+        self.ring: OutputRing | None = (
+            OutputRing(
+                keep_s=(delay_s or 0)
+                + settings.timeline.holdback_s
+                + settings.timeline.ring_extra_s
+            )
+            if mode == "A"
+            else None
+        )
+        self.timeline: Timeline | None = None
+        self.composer: Composer | None = None
+        self.hls_url = (
+            f"/hls/{session_id}/master.m3u8" if mode == "A" and hls_writer is not None else None
+        )
+        self._flush_fast = False
+        self._closing = False  # stop/abort 시작됨 (주기 태스크 종료 신호)
+        self._hls_started = False
+        self._lat: dict[str, deque[int]] = {
+            k: deque(maxlen=200) for k in ("stt", "mt", "tts", "diar")
+        }
         self.segmenter = Segmenter(
             settings.vad,
             vad,
@@ -165,17 +217,218 @@ class Session:
         self._emit_state("starting")
 
     async def begin(self) -> None:
-        """앱의 `control: start`. 모드 B·C 에는 지연 버퍼가 없으므로 바로 playing."""
+        """앱의 `control: start`. 모드 B·C 는 바로 playing, 모드 A 는 buffering → (D 뒤) playing."""
         if self.state != "starting":
             return
         if self._start_source_on_begin:
             try:
                 await self.source.start()
-            except (CaptureError, TimeoutError) as e:
+            except (CaptureError, TimeoutError, RuntimeError) as e:
                 self._emit("error", error_payload("E_CAPTURE_START", f"캡처 시작 실패: {e}", False))
                 await self.stop()
                 return
-        self._emit_state("playing")
+        if self.mode == "A":
+            await self._begin_mode_a()
+        else:
+            self._emit_state("playing")
+
+    # --- 모드 A (명세 §3, §4.5, §4.6) ---
+
+    async def _begin_mode_a(self) -> None:
+        assert self.ring is not None and self.delay_s is not None
+        self.timeline = Timeline(
+            delay_s=self.delay_s,
+            start_wall=time.time(),
+            segment_s=self._tl_cfg.segment_s,
+            holdback_s=self._tl_cfg.holdback_s,
+            guard_s=self._tl_cfg.guard_s,
+        )
+        self.composer = Composer(
+            self.timeline,
+            self.ring,
+            duck_db=self._tts_cfg.duck_db,
+            max_lag_s=self._tl_cfg.max_lag_s,
+        )
+        self.state = "buffering"
+        self._emit(
+            "session.state",
+            session_state_payload(
+                "buffering",
+                delay_s=self.delay_s,
+                play_start_wall_ms=self.timeline.play_start_wall_ms,
+            ),
+        )
+        self._tasks.append(
+            asyncio.create_task(self._composer_loop(), name=f"compose-{self.session_id}")
+        )
+        self._tasks.append(
+            asyncio.create_task(self._metrics_loop(), name=f"metrics-{self.session_id}")
+        )
+
+    async def _composer_loop(self) -> None:
+        """세그먼트 k 를 벽시계 compose_wall(k) 에 합성해 HLS 에 쓴다. 입력이 끝나면 남은 세그먼트를 바로 흘려 보낸다."""
+        assert self.timeline is not None and self.composer is not None and self.ring is not None
+        tl, comp = self.timeline, self.composer
+        try:
+            while True:
+                k = comp.next_k
+                if not self._flush_fast:
+                    wait = tl.compose_wall(k) - time.time()
+                    if wait > 0:
+                        await asyncio.sleep(min(wait, 0.5))
+                        if tl.compose_wall(k) - time.time() > 0:
+                            continue
+                else:
+                    # 입력 끝: 받은 오디오 끝까지만 합성하고 종료 (마지막 자막·TTS 가 들어갈 여유 1 세그먼트)
+                    if tl.segment_bounds_ms(k)[0] >= self.ring.total_ms + int(tl.segment_s * 1000):
+                        break
+                if self.state == "buffering" and time.time() >= tl.play_wall(0):
+                    self.state = "playing"
+                    self._emit(
+                        "session.state",
+                        session_state_payload(
+                            "playing",
+                            delay_s=self.delay_s,
+                            play_start_wall_ms=tl.play_start_wall_ms,
+                        ),
+                    )
+                if self.hls is not None and not self._hls_started and not await self._start_hls():
+                    return
+                seg = comp.compose(k)
+                if self.hls is not None:
+                    await self.hls.write_segment(seg.k, seg.pcm, seg.cues)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("컴포저 오류 session=%s", self.session_id)
+            self._emit("error", error_payload("E_OUTPUT_FAILED", "출력 합성 오류", False))
+        finally:
+            if self.hls is not None:
+                try:
+                    await self.hls.close()
+                except Exception:
+                    log.exception("HLS 닫기 실패")
+
+    async def _start_hls(self) -> bool:
+        """첫 세그먼트 직전에 HLS 인코더를 띄운다 (영상은 raw.ts 에 D−H 초가 쌓인 뒤라야 열린다). 영상 실패 → 소리 전용."""
+        try:
+            await self.hls.start()
+        except Exception as e:
+            inner = getattr(self.hls, "inner", None)
+            if inner is not None and getattr(inner, "video_path", None) is not None:
+                log.warning("HLS 영상 포함 시작 실패 (%s) → 소리 전용 재시도", e)
+                try:
+                    await asyncio.to_thread(inner.restart_without_video)
+                    self._emit(
+                        "error",
+                        error_payload(
+                            "E_OUTPUT_VIDEO",
+                            f"영상 출력을 열 수 없어 소리 전용으로 전환: {e}",
+                            True,
+                        ),
+                    )
+                except Exception as e2:
+                    log.exception("HLS 소리 전용 재시작도 실패")
+                    self._emit(
+                        "error", error_payload("E_OUTPUT_START", f"HLS 출력 시작 실패: {e2}", False)
+                    )
+                    asyncio.get_running_loop().create_task(self.stop())
+                    return False
+            else:
+                log.exception("HLS 출력 시작 실패")
+                self._emit(
+                    "error", error_payload("E_OUTPUT_START", f"HLS 출력 시작 실패: {e}", False)
+                )
+                asyncio.get_running_loop().create_task(self.stop())
+                return False
+        self._hls_started = True
+        return True
+
+    async def _metrics_loop(self) -> None:
+        """2 s 마다 `metrics` (명세 §6.2)."""
+        while not self._closing:
+            await asyncio.sleep(2.0)
+            if not self._closing:
+                self._emit("metrics", self._metrics_payload())
+
+    def _metrics_payload(self) -> dict:
+        def pct(values: deque[int], q: float) -> int | None:
+            if not values:
+                return None
+            s = sorted(values)
+            return s[min(len(s) - 1, int(q * (len(s) - 1)))]
+
+        info = gpu_info() or {}
+        return {
+            "p50_ms": {k: pct(v, 0.5) for k, v in self._lat.items()},
+            "p99_ms": {k: pct(v, 0.99) for k, v in self._lat.items()},
+            "gpu_util_stream": gpu_util(),
+            "miss_rate": self.composer.miss_rate if self.composer else 0.0,
+            "queue_depth": len(self._finals) + self._mt_queue.qsize(),
+            "gpu_mem_used_mb": info.get("mem_used_mb"),
+        }
+
+    def update_config(self, payload: dict) -> None:
+        """앱의 `config.update` (API 계약 Q-API-10): `{"volume": {"original": 0~1, "tts": 0~1}}`. 모르는 키는 무시."""
+        volume = payload.get("volume") if isinstance(payload, dict) else None
+        if isinstance(volume, dict) and self.composer is not None:
+            for key in ("original", "tts"):
+                v = volume.get(key)
+                if isinstance(v, (int, float)):
+                    self.composer.volume[key] = float(min(1.0, max(0.0, v)))
+
+    def _deadline(self, ev: DeadlineEvent | None) -> None:
+        if ev is not None:
+            self._emit(
+                "deadline.event",
+                {"seg_id": ev.seg_id, "kind": ev.kind, "level": ev.level, "late_ms": ev.late_ms},
+            )
+
+    def _add_cue(
+        self, kind: str, seg_id: int, t_start_ms: int, t_end_ms: int, text: str, speaker: str | None
+    ) -> None:
+        if self.composer is None or not text:
+            return
+        self._deadline(self.composer.add_cue(seg_id, kind, t_start_ms, t_end_ms, text, speaker))
+
+    async def _synthesize_for_timeline(
+        self, seg_id: int, speaker: str | None, text: str, lang: str, t_start_ms: int, t_end_ms: int
+    ) -> None:
+        """번역문을 TTS 로 합성해 타임라인에 놓는다 (`tts.ready`). 슬롯보다 길면 배속(≤ max_rate)으로 다시 합성."""
+        if self.composer is None or self.voices is None or not text:
+            return
+        t0 = time.perf_counter()
+        slot_ms = (t_end_ms - t_start_ms) + int(self._tts_cfg.max_overflow_s * 1000)
+        rate = 1.0
+        try:
+            result = await self.voices.synthesize(
+                text, lang=lang, voice_ref=self.tts_voice_ref, rate=1.0
+            )
+            if result.duration_ms > slot_ms and result.voice.supports_rate and slot_ms > 0:
+                rate = min(self._tts_cfg.max_rate, result.duration_ms / slot_ms)
+                if rate > 1.02:
+                    result = await self.voices.synthesize(
+                        text, lang=lang, voice_ref=self.tts_voice_ref, rate=round(rate, 2)
+                    )
+        except Exception as e:  # noqa: BLE001 — 음성이 없거나 엔진 오류: 자막만 나간다
+            log.warning("TTS 실패 seg=%s (%s): %s", seg_id, lang, e)
+            return
+        pcm, sr = _wav_to_float(result.wav)
+        pcm48 = resample_linear(pcm, sr, OUT_RATE)
+        tts_ms = int((time.perf_counter() - t0) * 1000)
+        self._lat["tts"].append(tts_ms)
+        self._deadline(self.composer.add_tts(seg_id, t_start_ms, pcm48, speaker))
+        payload = {
+            "seg_id": seg_id,
+            "duration_ms": len(pcm48) * 1000 // OUT_RATE,
+            "rate": round(rate, 2),
+            "voice_ref": result.voice.voice_ref,
+            "tts_ms": tts_ms,
+            "audio_url": None,
+        }
+        if speaker is not None:
+            payload["speaker"] = speaker
+        self._emit("tts.ready", payload)
 
     def feed(self, data: bytes) -> None:
         """모드 C 바이너리 PCM. start 없이 오디오가 먼저 와도 시작으로 본다 (API 계약 Q-API-5)."""
@@ -192,8 +445,13 @@ class Session:
         await asyncio.shield(self._stopping)
 
     async def _stop(self) -> None:
+        self._closing = True
         await self.source.stop()
+        self._flush_fast = True  # 모드 A: 남은 세그먼트를 바로 흘려 보낸다
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self.hls is not None and self.mode == "A":
+            loop = asyncio.get_running_loop()
+            loop.call_later(120, lambda: getattr(self.hls, "inner", self.hls).remove())
         lost = getattr(self.source, "lost_reason", None)
         if lost:
             # 남은 final 을 전부 보낸 뒤, stopped 바로 앞에 보낸다 (앱은 이 오류를 받으면 바로 세션을 끝낸다)
@@ -204,6 +462,7 @@ class Session:
 
     async def abort(self) -> None:
         """연결이 끊겨 결과를 받을 곳이 없을 때: 남은 작업을 버린다."""
+        self._closing = True
         await self.source.stop()
         for t in self._tasks:
             t.cancel()
@@ -211,6 +470,12 @@ class Session:
         self._discard_speakers()
         self.state = "stopped"
         self._close_logs()
+        if self.hls is not None:
+            try:
+                await self.hls.close()
+            except Exception as e:  # noqa: BLE001
+                log.warning("HLS 닫기 실패: %s", e)
+            getattr(self.hls, "inner", self.hls).remove()
 
     @property
     def stopped(self) -> bool:
@@ -405,11 +670,16 @@ class Session:
         self.state = state
         self._emit("session.state", session_state_payload(state, delay_s=None))
 
+    def _ring_from_frame(self, frame) -> None:
+        if self.ring is not None and getattr(self.source, "on_output", None) is None:
+            self.ring.push(resample_linear(frame.pcm, 16000, OUT_RATE))
+
     async def _ingest_loop(self) -> None:
         if self.stream is not None:
             await self._ingest_stream()
         else:
             async for frame in self.source.frames():
+                self._ring_from_frame(frame)
                 for ev in self.segmenter.push(frame.pcm):
                     if isinstance(ev, SpeechSegment):
                         self._finals.append(ev)
@@ -450,6 +720,7 @@ class Session:
     async def _ingest_stream(self) -> None:
         sd = self.stream
         async for frame in self.source.frames():
+            self._ring_from_frame(frame)
             sd.push(frame.pcm)
             if sd.ready:
                 await self._stream_step(final=False)
@@ -516,12 +787,26 @@ class Session:
             item = await self._mt_queue.get()
             if item is None:
                 return
-            seg_id, speaker, text, lang = item
-            await self._translate_one(seg_id, speaker, text, lang)
+            seg_id, speaker, text, lang, t_start_ms, t_end_ms = item
+            tr = await self._translate_one(seg_id, speaker, text, lang)
+            if tr is not None and self.mode == "A":
+                self._add_cue("tgt", seg_id, t_start_ms, t_end_ms, tr.text, speaker)
+                if self.tts_enabled and tr.text and tr.src_lang != tr.tgt_lang:
+                    await self._synthesize_for_timeline(
+                        seg_id, speaker, tr.text, tr.tgt_lang, t_start_ms, t_end_ms
+                    )
 
-    def _queue_translation(self, seg_id: int, speaker: str | None, text: str, lang: str) -> None:
+    def _queue_translation(
+        self,
+        seg_id: int,
+        speaker: str | None,
+        text: str,
+        lang: str,
+        t_start_ms: int = 0,
+        t_end_ms: int = 0,
+    ) -> None:
         if text:
-            self._mt_queue.put_nowait((seg_id, speaker, text, lang))
+            self._mt_queue.put_nowait((seg_id, speaker, text, lang, t_start_ms, t_end_ms))
 
     def _glossary(self, src: str) -> dict[str, str]:
         key = f"{src}->{self.tgt_lang}"
@@ -529,7 +814,9 @@ class Session:
             self._glossary_cache[key] = load_glossary(self._mt_cfg.glossary, src, self.tgt_lang)
         return self._glossary_cache[key]
 
-    async def _translate_one(self, seg_id: int, speaker: str | None, text: str, lang: str) -> None:
+    async def _translate_one(
+        self, seg_id: int, speaker: str | None, text: str, lang: str
+    ) -> Translation | None:
         src = (lang or "").split("-")[0].lower()
         if self.translator is None or not src or src == self.tgt_lang:
             # 번역 엔진이 없거나 같은 언어: 원문을 그대로 (앱은 translation.final 이 있어야 줄이 완성된다)
@@ -586,6 +873,9 @@ class Session:
         if speaker is not None:
             payload["speaker"] = speaker
         self._emit("translation.final", payload)
+        if tr.engine != "passthrough":
+            self._lat["mt"].append(tr.latency_ms)
+        return tr
 
     # --- 중간 결과 ---
 
@@ -666,11 +956,17 @@ class Session:
         kept = [r for r in results if r[1].text] or results[:1]
         for speaker, tr, stt_ms in kept:
             shown = speaker if speaker is not None else (seg.speakers[0] if seg.speakers else None)
-            self._emit(
-                "segment.final",
-                final_payload(seg, tr, stt_ms, speaker=shown, diar_ms=diar_ms),
+            payload = final_payload(seg, tr, stt_ms, speaker=shown, diar_ms=diar_ms)
+            self._emit("segment.final", payload)
+            self._lat["stt"].append(stt_ms)
+            if diar_ms is not None:
+                self._lat["diar"].append(diar_ms)
+            self._add_cue(
+                "src", seg.seg_id, payload["t_start_ms"], payload["t_end_ms"], tr.text, shown
             )
-            self._queue_translation(seg.seg_id, shown, tr.text, tr.lang)
+            self._queue_translation(
+                seg.seg_id, shown, tr.text, tr.lang, payload["t_start_ms"], payload["t_end_ms"]
+            )
 
     async def _attach_speakers(self, seg: SpeechSegment) -> int | None:
         """Diarizer 로 화자 구간을 받아 발화에 붙인다. 실패하면 화자 없이 진행 (경고만)."""

@@ -47,6 +47,9 @@ tts:
     en-US: "system:auto"
     ja-JP: "openjtalk:default"
   max_chars: 500
+  max_rate: 1.25              # 모드 A TTS 최대 배속
+  max_overflow_s: 1.0
+  duck_db: -12
   cache_items: 128
 mt:                           # 번역 (명세 §4.4). 자막은 번역이 실패해도 원문(passthrough)으로 나간다
   engine: ollama_llm          # Ollama 로컬 LLM (http://127.0.0.1:11434). Ollama 가 없으면 passthrough 로 자동 폴백
@@ -55,6 +58,18 @@ mt:                           # 번역 (명세 §4.4). 자막은 번역이 실�
   context_pairs: 3            # 화자별 직전 (원문, 번역) 쌍
   timeout_s: 6.0
   glossary: config/glossary.yaml   # 용어집 (+ glossary.local.yaml). 형식: {"ja->ko": {용어: 번역}, "*->ko": {...}}
+
+timeline:                     # 모드 A 시간 모델 (명세 §3)
+  segment_s: 1.0
+  holdback_s: 3.0             # H
+  guard_s: 1.0                # G
+  default_delay_s: 36         # D 기본값 (요청 delay_s 가 null 일 때). 테스트는 요청에서 10~15 로
+  max_lag_s: 8.0              # 자막·TTS 가 이보다 늦으면 버림 (L3). D 가 충분하면 생기지 않는다
+tools:
+  ffmpeg: null                # null = PATH → ~/Downloads/ffmpeg*/bin 자동 탐색. 다른 위치면 경로 지정
+output:
+  hls_dir: runtime/hls        # 세션별 HLS (gitignore, 세션 종료 2분 뒤 삭제)
+  video_codec: copy           # copy | h264_nvenc | libx264
 
 logging:
   dir: "logs"                 # gitignore. 세션 기록 (명세 §11)

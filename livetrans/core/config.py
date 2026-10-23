@@ -77,6 +77,30 @@ def _default_tts_voices() -> dict[str, str]:
     return {"ko-KR": "system:auto", "en-US": "system:auto", "ja-JP": "openjtalk:default"}
 
 
+class TimelineConfig(BaseModel):
+    """모드 A 시간 모델 (명세 §3). D 는 세션 요청의 delay_s 가 없을 때 기본값."""
+
+    segment_s: float = 1.0
+    holdback_s: float = 3.0  # H: 플레이어가 라이브 끝에서 떨어져 재생하는 버퍼
+    guard_s: float = 1.0  # G
+    default_delay_s: int = 36  # D 기본 (D-022 최악 가정). 테스트는 요청에서 작게
+    ring_extra_s: float = 30.0  # 원본 출력 링버퍼 여유
+    max_lag_s: float = (
+        8.0  # 결과가 이보다 늦으면 버림 (L3). L_max(8 s) 발화가 D 부족 시에도 버려지지 않게
+    )
+
+
+class ToolsConfig(BaseModel):
+    ffmpeg: str | None = None  # 없으면 PATH → ~/Downloads/ffmpeg*/bin 순으로 찾는다
+
+
+class OutputConfig(BaseModel):
+    hls_dir: str = "runtime/hls"  # gitignore. 세션마다 하위 디렉터리, 세션 종료 후 삭제
+    video_codec: str = (
+        "copy"  # copy | h264_nvenc | libx264 (copy 는 입력 키프레임 간격으로 세그먼트가 잘린다)
+    )
+
+
 class TtsConfig(BaseModel):
     """엔진 인스턴스와 언어별 기본 음성 (명세 §5.4 를 default.yaml 의 tts 섹션으로)."""
 
@@ -84,6 +108,9 @@ class TtsConfig(BaseModel):
     defaults: dict[str, str] = Field(default_factory=_default_tts_voices)
     max_chars: int = 500
     cache_items: int = 128
+    max_rate: float = 1.25  # 모드 A: TTS 가 슬롯보다 길면 이 배속까지 빠르게 (§3.6)
+    max_overflow_s: float = 1.0  # 발화 길이보다 이만큼은 넘쳐도 그대로
+    duck_db: float = -12.0  # TTS 가 나는 동안 원본 음량
 
 
 class MtConfig(BaseModel):
@@ -119,6 +146,9 @@ class Settings(BaseModel):
     diar: DiarConfig = DiarConfig()
     tts: TtsConfig = TtsConfig()
     mt: MtConfig = MtConfig()
+    timeline: TimelineConfig = TimelineConfig()
+    tools: ToolsConfig = ToolsConfig()
+    output: OutputConfig = OutputConfig()
     logging: LoggingConfig = LoggingConfig()
 
 
