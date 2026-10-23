@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from livetrans.core.config import DiarConfig, load_settings
+from livetrans.core.config import DEFAULT_CONFIG_DIR, DiarConfig, Settings, _read_yaml
 from livetrans.core.speaker import SpeakerTurn, select_speakers, speaker_extent, speaking_ms
 from livetrans.plugins.diar import create_diarizer
 from livetrans.plugins.diar.fake import FakeDiarizerEngine
@@ -138,7 +138,8 @@ def test_pyannote_create_before_load_raises():
 
 
 def test_repo_default_diar_is_off_until_app_supports_speaker():
-    s = load_settings()
+    # default.local.yaml(개인 설정) 은 빼고 저장소 기본값만 본다
+    s = Settings.model_validate(_read_yaml(DEFAULT_CONFIG_DIR / "default.yaml"))
     assert s.diar.engine == "none"  # API 계약 S-16: 앱 반영 전까지 speaker 미송신
     assert s.diar.max_speakers_per_seg == 2 and s.diar.max_speakers == 4
 

@@ -22,6 +22,7 @@ from livetrans.core.config import SttConfig
 from livetrans.core.gpu import GPU_LOCK
 from livetrans.pipeline.segmenter import SpeechSegment
 from livetrans.plugins.stt.base import Transcript
+from livetrans.plugins.stt.guard import max_new_tokens_for
 from livetrans.plugins.stt.stno import N_FRAMES_30S, build_stno_mask
 
 log = logging.getLogger("livetrans.stt.dicow")
@@ -164,6 +165,8 @@ class DiCoWSTT:
                 "task": "transcribe",
                 "num_beams": self.cfg.beam_final if final else self.cfg.beam_partial,
                 "return_timestamps": False,
+                # 반복 환각이 토큰 상한(448)까지 달리지 않게 오디오 길이에 비례해 자른다 (guard.py)
+                "max_new_tokens": max_new_tokens_for(duration_ms),
             }
             if prompt_ids is not None:
                 gen_kwargs["prompt_ids"] = prompt_ids

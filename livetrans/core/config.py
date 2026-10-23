@@ -79,8 +79,13 @@ class TtsConfig(BaseModel):
 
 
 class LoggingConfig(BaseModel):
+    """세션 기록 (명세 §11). 기본값은 꺼짐 — 저장소 `default.yaml` 이 켠다 (테스트가 파일을 남기지 않게)."""
+
     dir: str = "logs"
-    per_session_jsonl: bool = True
+    per_session_jsonl: bool = False  # 세션마다 보낸 이벤트 전부를 logs/<날짜>_<세션>.jsonl 에
+    dump_audio: bool = (
+        False  # 확정 발화 PCM 을 logs/audio/<날짜>_<세션>/segNNNN.wav 로 (실패 사례 분석용)
+    )
 
 
 class Settings(BaseModel):

@@ -43,5 +43,7 @@ tts:
   max_chars: 500
   cache_items: 128
 logging:
-  dir: "logs"
-  per_session_jsonl: true
+  dir: "logs"                 # gitignore. 세션 기록 (명세 §11)
+  per_session_jsonl: true     # 보낸 이벤트 전부 → logs/<날짜>_<세션>.jsonl (자막 오류 사례 수집)
+  dump_audio: false           # true 면 확정 발화 PCM 을 logs/audio/<날짜>_<세션>/segNNNN.wav 로 저장 — 오프라인 엔진 비교·화자 분할 분석용.
+                              #   개인 테스트 전용(방송 음성이 디스크에 남음), 분석이 끝나면 지울 것. default.local.yaml 에서 켠다.
