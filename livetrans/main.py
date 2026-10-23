@@ -10,12 +10,14 @@ import numpy as np
 from fastapi import FastAPI
 
 from livetrans.api.capture import router as capture_router
+from livetrans.api.hls import router as hls_router
 from livetrans.api.rest import router as rest_router
 from livetrans.api.sessions import router as sessions_router
 from livetrans.api.tts import router as tts_router
 from livetrans.core.config import Settings, SttConfig, load_settings
 from livetrans.core.gpu import prepare_cuda_dlls
 from livetrans.core.voices import VoiceRegistry
+from livetrans.output.hls import find_ffmpeg
 from livetrans.plugins.diar import create_diarizer
 from livetrans.plugins.diar.base import DiarizerEngine
 from livetrans.plugins.mt import create_translator
@@ -133,6 +135,13 @@ def create_app(
         await engine.load()
         app.state.settings = settings
         app.state.stt = engine
+        app.state.ffmpeg = find_ffmpeg(settings.tools.ffmpeg)
+        if app.state.ffmpeg:
+            log.info("ffmpeg: %s", app.state.ffmpeg)
+        else:
+            log.warning(
+                "ffmpeg 를 찾지 못함 → 모드 A(HLS 출력) 사용 불가. tools.ffmpeg 에 경로를 지정하세요"
+            )
         app.state.stt_rescue = await _load_rescue(settings, stt_rescue)
         app.state.diar = await _load_diarizer(settings, diar)
         app.state.mt = await _load_translator(settings, translator)
@@ -173,6 +182,7 @@ def create_app(
     app.include_router(sessions_router)
     app.include_router(capture_router)
     app.include_router(tts_router)
+    app.include_router(hls_router)
     return app
 
 
