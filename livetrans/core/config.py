@@ -86,6 +86,21 @@ class TtsConfig(BaseModel):
     cache_items: int = 128
 
 
+class MtConfig(BaseModel):
+    """번역 (명세 §4.4). 기본 Ollama 로컬 LLM, 실패하면 체인 → 마지막은 항상 원문(passthrough)."""
+
+    engine: str = "passthrough"  # ollama_llm | passthrough. 모델 기본값은 passthrough(테스트가 네트워크를 안 타게), 저장소 default.yaml 이 ollama_llm 으로 켠다
+    model: str = "gemma2:9b"  # 2026-10-23 측정: 190~440 ms/문장(서버와 함께 100 % GPU, 6.3 GB), 한국어 자연스러움. qwen2.5:7b 는 한국어 출력 중 중국어로 샘
+    url: str = "http://127.0.0.1:11434"
+    fallback: list[str] = Field(default_factory=lambda: ["passthrough"])
+    context_pairs: int = 3  # 화자별 직전 (원문, 번역) 쌍 수
+    timeout_s: float = 6.0  # 이 시간 안에 못 오면 다음 엔진
+    keep_alive: str = "30m"
+    temperature: float = 0.1
+    max_tokens: int = 200
+    glossary: str | None = "config/glossary.yaml"  # + glossary.local.yaml (gitignore)
+
+
 class LoggingConfig(BaseModel):
     """세션 기록 (명세 §11). 기본값은 꺼짐 — 저장소 `default.yaml` 이 켠다 (테스트가 파일을 남기지 않게)."""
 
@@ -103,6 +118,7 @@ class Settings(BaseModel):
     stt: SttConfig = SttConfig()
     diar: DiarConfig = DiarConfig()
     tts: TtsConfig = TtsConfig()
+    mt: MtConfig = MtConfig()
     logging: LoggingConfig = LoggingConfig()
 
 

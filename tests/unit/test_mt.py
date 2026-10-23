@@ -1,0 +1,207 @@
+"""번역 플러그인 (명세 §4.4) — Ollama 어댑터는 httpx MockTransport 로, 네트워크 없이."""
+
+import json
+from pathlib import Path
+
+import httpx
+import pytest
+
+from livetrans.core.config import MtConfig
+from livetrans.plugins.mt import FallbackTranslator, create_translator, load_glossary
+from livetrans.plugins.mt.base import TranslationError
+from livetrans.plugins.mt.ollama_llm import OllamaTranslator, build_messages, parse_translation
+from livetrans.plugins.mt.passthrough import PassthroughTranslator
+
+
+def test_build_messages_has_system_context_and_glossary():
+    msgs = build_messages(
+        "今日はいい天気ですね",
+        src="ja",
+        tgt="ko",
+        context=[("こんにちは", "안녕하세요")],
+        glossary={"配信": "방송"},
+        length_budget_s=3.0,
+    )
+    assert msgs[0]["role"] == "system"
+    assert "Japanese" in msgs[0]["content"] and "Korean" in msgs[0]["content"]
+    assert "配信 -> 방송" in msgs[0]["content"] and "3 seconds" in msgs[0]["content"]
+    assert [m["role"] for m in msgs[1:]] == ["user", "assistant", "user"]
+    assert json.loads(msgs[2]["content"]) == {"translation": "안녕하세요"}
+    assert msgs[-1]["content"] == "今日はいい天気ですね"
+
+
+def test_parse_translation_accepts_json_and_rejects_garbage():
+    assert parse_translation('{"translation": "안녕"}') == "안녕"
+    assert parse_translation('Sure! {"translation": "안녕"} ok') == "안녕"
+    assert parse_translation("") is None
+    assert parse_translation("just text") is None
+    assert parse_translation('{"other": 1}') is None
+    assert parse_translation('{"translation": 3}') is None
+
+
+def _ollama(handler, **cfg) -> OllamaTranslator:
+    transport = httpx.MockTransport(handler)
+    client = httpx.AsyncClient(base_url="http://ollama.test", transport=transport)
+    return OllamaTranslator(MtConfig(engine="ollama_llm", model="qwen2.5:7b", **cfg), client=client)
+
+
+async def test_ollama_translate_posts_chat_with_json_format():
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen2.5:7b"}]})
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(
+            200,
+            json={
+                "message": {"role": "assistant", "content": '{"translation": "오늘 날씨 좋네요"}'}
+            },
+        )
+
+    mt = _ollama(handler)
+    await mt.load()
+    out = await mt.translate("今日はいい天気", src="ja", tgt="ko", context=[], glossary={})
+    assert out == "오늘 날씨 좋네요"
+    body = seen["body"]
+    assert body["model"] == "qwen2.5:7b" and body["format"] == "json" and body["stream"] is False
+    assert body["messages"][-1] == {"role": "user", "content": "今日はいい天気"}
+    assert body["options"]["temperature"] == 0.1
+
+
+async def test_ollama_retries_once_on_bad_json_then_raises():
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(req.content))
+        return httpx.Response(200, json={"message": {"content": "not json at all"}})
+
+    mt = _ollama(handler)
+    with pytest.raises(TranslationError):
+        await mt.translate("x", src="en", tgt="ko", context=[], glossary={})
+    assert len(calls) == 2
+    assert "Invalid format" in calls[1]["messages"][-1]["content"]
+
+
+async def test_ollama_timeout_and_http_error_become_translation_error():
+    def timeout(req: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=req)
+
+    with pytest.raises(TranslationError):
+        await _ollama(timeout).translate("x", src="en", tgt="ko", context=[], glossary={})
+
+    def err(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    with pytest.raises(TranslationError):
+        await _ollama(err).translate("x", src="en", tgt="ko", context=[], glossary={})
+
+
+async def test_ollama_load_fails_when_model_missing():
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"models": [{"name": "other:1b"}]})
+
+    with pytest.raises(TranslationError, match="qwen2.5:7b"):
+        await _ollama(handler).load()
+
+
+class Boom:
+    name = "boom"
+    model_id = "x"
+
+    def __init__(self, fail_load=False):
+        self.fail_load = fail_load
+
+    async def load(self):
+        if self.fail_load:
+            raise TranslationError("없음")
+
+    async def health(self):
+        return True
+
+    async def translate(self, text, *, src, tgt, context, glossary, length_budget_s=None):
+        raise TranslationError("실패")
+
+    async def close(self):
+        return None
+
+
+async def test_fallback_chain_marks_fallback_and_drops_dead_engines():
+    chain = FallbackTranslator([Boom(), PassthroughTranslator()])
+    await chain.load()
+    tr = await chain.translate_full(
+        7, "hello", src="en", tgt="ko", context=[], glossary={}, speaker="S1"
+    )
+    assert (tr.text, tr.engine, tr.fallback, tr.seg_id, tr.speaker) == (
+        "hello",
+        "passthrough",
+        True,
+        7,
+        "S1",
+    )
+
+    dead = FallbackTranslator([Boom(fail_load=True), PassthroughTranslator()])
+    await dead.load()
+    assert [e.name for e in dead.active] == ["passthrough"] and dead.name == "passthrough"
+    tr = await dead.translate_full(1, "hi", src="en", tgt="ko", context=[], glossary={})
+    assert tr.fallback is False  # 살아 있는 첫 엔진이 곧 1순위
+
+    with pytest.raises(TranslationError):
+        await FallbackTranslator([Boom(fail_load=True)]).load()
+
+
+def test_create_translator_appends_passthrough():
+    chain = create_translator(MtConfig(engine="ollama_llm", fallback=[]))
+    assert isinstance(chain, FallbackTranslator)
+    assert [e.name for e in chain.active] == ["ollama_llm", "passthrough"]
+    assert isinstance(
+        create_translator(MtConfig(engine="passthrough", fallback=[])), PassthroughTranslator
+    )
+    with pytest.raises(ValueError):
+        create_translator(MtConfig(engine="nope"))
+
+
+def test_load_glossary_merges_pair_and_wildcards(tmp_path: Path):
+    base = tmp_path / "glossary.yaml"
+    base.write_text(
+        '"*->ko": {Twitch: 트위치}\n"ja->ko": {配信: 방송}\n"en->ko": {chat: 채팅}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "glossary.local.yaml").write_text(
+        '"ja->ko": {リスナー: 시청자, 配信: 스트리밍}\n', encoding="utf-8"
+    )
+    g = load_glossary(base, "ja", "ko")
+    assert g == {"Twitch": "트위치", "配信": "스트리밍", "リスナー": "시청자"}  # local 이 덮어쓴다
+    assert load_glossary(base, "en", "ja") == {}
+    assert (
+        load_glossary(None, "ja", "ko") == {}
+        and load_glossary(tmp_path / "none.yaml", "ja", "ko") == {}
+    )
+
+
+def test_script_problem_detects_wrong_writing_system():
+    from livetrans.plugins.mt.ollama_llm import script_problem
+
+    assert script_problem("차를 열为啥要开这个车呢", "ko") is not None
+    assert script_problem("안녕하세요 여러분 자막 테스트입니다", "ko") is None
+    assert script_problem("Today's weather is nice.", "en") is None
+    assert script_problem("Today 날씨 is nice", "en") is not None
+    assert script_problem("今日はいい天気ですね", "ja") is None
+    assert script_problem("今日は 날씨", "ja") is not None
+    assert script_problem("1234 !!", "ko") is None
+
+
+async def test_ollama_retries_when_output_script_is_wrong_then_raises():
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(req.content))
+        return httpx.Response(
+            200, json={"message": {"content": '{"translation": "차를 열为啥要开这个车呢"}'}}
+        )
+
+    with pytest.raises(TranslationError, match="한자"):
+        await _ollama(handler).translate(
+            "can i ask why", src="en", tgt="ko", context=[], glossary={}
+        )
+    assert len(calls) == 2 and "Korean script" in calls[1]["messages"][-1]["content"]

@@ -18,6 +18,8 @@ from livetrans.core.gpu import prepare_cuda_dlls
 from livetrans.core.voices import VoiceRegistry
 from livetrans.plugins.diar import create_diarizer
 from livetrans.plugins.diar.base import DiarizerEngine
+from livetrans.plugins.mt import create_translator
+from livetrans.plugins.mt.base import Translator
 from livetrans.plugins.source.loopback import CaptureBackend
 from livetrans.plugins.stt import create_stt
 from livetrans.plugins.stt.base import STTEngine
@@ -95,6 +97,18 @@ async def _load_rescue(settings: Settings, injected: STTEngine | None) -> STTEng
     return engine
 
 
+async def _load_translator(settings: Settings, injected: Translator | None) -> Translator | None:
+    """번역 체인 로드. Ollama 가 없으면 체인이 passthrough 만 남긴다. 전부 실패하면 번역 없이 (자막만)."""
+    engine = injected or create_translator(settings.mt)
+    try:
+        await engine.load()
+    except Exception as e:  # noqa: BLE001
+        log.warning("번역 엔진 로드 실패 → 번역 없이 진행: %s", e)
+        return None
+    log.info("번역 엔진: %s (%s)", engine.name, engine.model_id)
+    return engine
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -104,6 +118,7 @@ def create_app(
     tts_engines: dict[str, TTSEngine] | None = None,
     diar: DiarizerEngine | None = None,
     stt_rescue: STTEngine | None = None,
+    translator: Translator | None = None,
 ) -> FastAPI:
     """stt·vad_factory·capture·tts_engines·diar 는 테스트에서 가짜를 주입할 때만 넘긴다."""
     settings = settings or load_settings()
@@ -120,6 +135,7 @@ def create_app(
         app.state.stt = engine
         app.state.stt_rescue = await _load_rescue(settings, stt_rescue)
         app.state.diar = await _load_diarizer(settings, diar)
+        app.state.mt = await _load_translator(settings, translator)
         app.state.vad_factory = vad_factory or _silero_factory
         app.state.capture = capture or CaptureBackend()
         voices = VoiceRegistry(
@@ -135,6 +151,8 @@ def create_app(
             app.state.models_loaded.append(f"stt_rescue:{r.name}:{r.model_id}")
         if app.state.diar is not None:
             app.state.models_loaded.append(f"diar:{app.state.diar.name}:{app.state.diar.model_id}")
+        if app.state.mt is not None and app.state.mt.name != "passthrough":
+            app.state.models_loaded.append(f"mt:{app.state.mt.name}:{app.state.mt.model_id}")
         app.state.models_loaded += [f"tts:{name}" for name in voices.engines]
         app.state.sessions = {}
         yield
@@ -145,6 +163,8 @@ def create_app(
             await app.state.stt_rescue.close()
         if app.state.diar is not None:
             await app.state.diar.close()
+        if app.state.mt is not None:
+            await app.state.mt.close()
         for tts in voices.engines.values():
             await tts.close()
 

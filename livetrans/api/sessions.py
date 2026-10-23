@@ -95,7 +95,9 @@ async def create_session(body: SessionCreate, request: Request) -> dict:
         source,
         mode=body.mode,
         src_lang=None if body.src_lang in (None, "auto") else body.src_lang,
+        tgt_lang=body.tgt_lang,
         rescue_stt=getattr(app.state, "stt_rescue", None),
+        translator=getattr(app.state, "mt", None),
         **_diarizer_kwargs(app),
     )
     await session.start()

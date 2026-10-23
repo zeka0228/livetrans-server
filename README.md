@@ -31,6 +31,7 @@ uv run python scripts\download_models.py --all      # + kotoba-whisper(일본어
 
 - 기본 STT 는 **DiCoW** (화자 조건부 Whisper, `stt.engine: dicow`) 이고 로드에 실패하면 `stt.fallback` 의 faster-whisper large-v3 로 자동 전환됩니다. 엔진·모델은 `config/default.local.yaml` 의 `stt` 섹션으로 바꿉니다.
 - **화자 분할**(pyannote `speaker-diarization-community-1`, CC BY 4.0)은 기본 **꺼져** 있습니다 (`diar.engine: none`). 켜려면 Hugging Face 에서 모델 이용 조건에 동의하고 토큰을 설정한 뒤(`hf auth login` 또는 `HF_TOKEN`) `uv run python scripts\download_models.py --diar` 로 받고, `config/default.local.yaml` 에 `diar: {engine: pyannote}` 를 둡니다. 켜지면 `segment.final` 에 `speaker`(`"S0"`, `"S1"`…) 가 붙고, 한 발화에 화자가 둘이면 같은 `seg_id` 로 화자별 final 이 하나씩 옵니다 (DiCoW 가 화자마다 따로 인식). 화자 임베딩은 세션 메모리에만 두고 저장하지 않습니다.
+- **번역**은 로컬 [Ollama](https://ollama.com) 의 LLM(`mt.engine: ollama_llm`, 기본 `gemma2:9b`)으로 합니다. Ollama 가 떠 있고 모델이 받아져 있어야 하며(`ollama pull gemma2:9b`, VRAM 약 6 GB), 없으면 자동으로 원문 그대로(`passthrough`) 내보냅니다. 고유명사는 `config/glossary.yaml`(개인은 `glossary.local.yaml`)에 고정 번역으로 적습니다.
 - 사용하는 모델·소프트웨어의 출처와 라이선스(출처 표기 의무 포함)는 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 에 있습니다.
 
 테스트:
