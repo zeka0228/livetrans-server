@@ -124,3 +124,25 @@ def test_vtt_segment_format():
     assert "00:00:01.800 --> 00:00:02.800\nhi\n" in text
     assert vtt_timestamp(3_723_004) == "01:02:03.004"
     assert vtt_segment([], mpegts_offset=0).count("-->") == 0
+
+
+def test_replace_cue_only_before_it_is_composed():
+    comp, _ = make_composer()
+    comp.add_cue(1, "tgt", 2300, 3800, "first", "S0")
+    comp.compose(0)  # 0~1000 합성: 큐(2300~)는 아직 안 나감
+    assert comp.replace_cue(1, "tgt", "S0", "revised") is True
+    assert [c.text for c in comp.compose(2).cues["tgt"]] == ["revised"]
+    # 이미 보이기 시작한 큐는 못 바꾼다
+    assert comp.replace_cue(1, "tgt", "S0", "too late") is False
+    assert comp.replace_cue(9, "tgt", "S0", "x") is False  # 없는 큐
+
+
+def test_replace_tts_only_before_it_is_composed():
+    comp, _ = make_composer()
+    comp.add_tts(1, 2300, np.ones(OUT_RATE // 2, dtype=np.float32) * 0.1, "S0")
+    comp.compose(0)
+    new = np.ones(OUT_RATE // 2, dtype=np.float32) * 0.3
+    assert comp.replace_tts(1, "S0", new) is True
+    comp.compose(1)
+    comp.compose(2)
+    assert comp.replace_tts(1, "S0", new) is False

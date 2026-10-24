@@ -64,6 +64,12 @@ mt:                           # 번역 (명세 §4.4). 자막은 번역이 실�
   model: gemma4:e4b           # 벤치 2026-10-25 (40문장 chrF ja/en, 서버와 동시): gemma4:e4b 56/43 0.2 s 3.3 GB · gemma3:12b-it-qat 41/34 1.0 s 8.8 GB · gemma2:9b 39/24 0.3 s 6.3 GB
   fallback: [passthrough]
   context_pairs: 3            # 화자별 직전 (원문, 번역) 쌍
+  lookahead_s: 3.0            # 모드 A: 번역 전에 뒤따르는 발화를 최대 이만큼 기다려 앞뒤 문맥으로 단어 교정 (데드라인 안에서만). 0 = 끔
+  lookahead_lines: 2          # 기다릴 뒤 발화 수
+  revise: true                # 2차 패스: 뒤 문맥 없이 번역된 발화를 다음 발화 확정 뒤 한 번 더 번역·원문 교정 → *.update 이벤트 (S-28)
+  revise_window_s: 10.0       # 이보다 오래된 발화는 2차 패스 안 함
+  revise_max_edit: 0.5        # 원문 교정 허용 편집 비율 (넘으면 통째 바꿔 쓴 것으로 보고 버림)
+  dialogue_lines: 8           # 프롬프트에 넣는 최근 대화(모든 화자) 줄 수. 상대 발화로 지시어·생략 주어·STT 오류를 고친다 (2026-10-25)
   timeout_s: 6.0
   think: false                # 추론 모델(qwen3·gemma4)의 사고 출력 끔 — 켜 두면 토큰을 다 써 빈 출력 (벤치 2026-10-25)
   use_mmap: true              # Ollama 러너가 모델 파일을 mmap 으로 열게. false 면 힙 복사로 RAM 이 +7 GB (2026-10-25 측정)

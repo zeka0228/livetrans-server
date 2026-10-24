@@ -40,6 +40,16 @@ LANG_NAMES = {
 }
 
 
+DialogueLine = tuple[str | None, str, str]  # (화자, 원문, 번역)
+UpcomingLine = tuple[str | None, str]  # (화자, 원문) — 아직 번역 안 된 뒤 발화
+MAX_DIALOGUE_LINES = 12
+MAX_UPCOMING_LINES = 3
+
+
+def _clip(s: str, n: int = 80) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
 def lang_name(code: str) -> str:
     return LANG_NAMES.get(code.split("-")[0].lower(), code)
 
@@ -52,21 +62,53 @@ def build_messages(
     context: list[ContextPair],
     glossary: dict[str, str],
     length_budget_s: float | None = None,
+    dialogue: list[DialogueLine] | None = None,
+    speaker: str | None = None,
+    upcoming: list[UpcomingLine] | None = None,
+    want_source: bool = False,
 ) -> list[dict[str, str]]:
-    """Ollama chat 메시지. 문맥 쌍은 (user 원문 → assistant JSON) 대화로 넣어 모델이 형식을 따라가게 한다."""
+    """Ollama chat 메시지. 같은 화자의 문맥 쌍은 (user 원문 → assistant JSON) 대화로 넣어 모델이 형식을 따라가게 하고,
+    최근 대화(모든 화자)는 시스템 메시지에 "화자: 원문 -> 번역" 줄로 넣는다 (지시어·생략 주어·STT 오류 교정 재료)."""
     system = (
         f"You are a live-broadcast subtitle translator. Translate the user's {lang_name(src)} utterance "
         f"into natural, concise {lang_name(tgt)} as spoken subtitles for viewers. Keep the speaker's tone. "
         "Keep proper names, game terms and numbers; do not add explanations or omit content. "
-        "The input is automatic speech recognition output without punctuation and may contain small errors; "
-        "infer the intended meaning from context."
+        "The input is automatic speech recognition output without punctuation and may contain recognition errors "
+        "(homophones, dropped particles, split or merged words). First silently correct such errors using the "
+        "dialogue context, then translate the intended meaning. Resolve pronouns, omitted subjects and the level of "
+        "politeness from the dialogue, and keep names and terms consistent with earlier lines."
     )
+    if dialogue:
+        tag = f" The current speaker is {speaker}." if speaker else ""
+        shown = "\n".join(
+            f"{'> ' if speaker and who == speaker else ''}{who or 'speaker'}: {_clip(s)} -> {_clip(t)}"
+            for who, s, t in dialogue[-MAX_DIALOGUE_LINES:]
+        )
+        system += " Recent dialogue, oldest first (speaker: original -> translation):\n"
+        system += f"{shown}\n{tag}"
+    if upcoming:
+        nxt = "\n".join(
+            f"{who or 'speaker'}: {_clip(s)}" for who, s in upcoming[:MAX_UPCOMING_LINES]
+        )
+        system += (
+            " Lines spoken right after the current utterance (not yet translated). Use them only to "
+            "disambiguate words and fix recognition errors in the current line; never translate or merge "
+            f"them into the output:\n{nxt}\n"
+        )
     if glossary:
         pairs = "; ".join(f"{k} -> {v}" for k, v in list(glossary.items())[:60])
         system += f" Use these fixed translations when the term appears: {pairs}."
     if length_budget_s:
         system += f" The translation will be spoken aloud in about {length_budget_s:.0f} seconds, so keep it short."
-    system += ' Respond with JSON only: {"translation": "<translated text>"}'
+    if want_source:
+        system += (
+            ' This is a second pass with more context. Also return the corrected original line as "source": '
+            "the same language and the same content with recognition errors fixed; if nothing needs fixing, "
+            "copy the original unchanged. Respond with JSON only: "
+            '{"translation": "<translated text>", "source": "<corrected original>"}'
+        )
+    else:
+        system += ' Respond with JSON only: {"translation": "<translated text>"}'
     messages: list[dict[str, str]] = [{"role": "system", "content": system}]
     for s, t in context:
         messages.append({"role": "user", "content": s})
@@ -105,25 +147,33 @@ def script_problem(text: str, tgt: str) -> str | None:
 
 def parse_translation(content: str) -> str | None:
     """모델 출력(JSON 한 줄)에서 번역문. 형식이 어긋나면 None."""
+    return parse_result(content)[0]
+
+
+def parse_result(content: str) -> tuple[str | None, str | None]:
+    """모델 출력에서 (번역문, 교정 원문). 번역문이 없으면 (None, None); 교정 원문은 2차 패스에서만 온다."""
     content = content.strip()
     if not content:
-        return None
+        return None, None
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
         # 앞뒤에 군말이 붙은 경우 첫 { … } 만 시도
         a, b = content.find("{"), content.rfind("}")
         if a < 0 or b <= a:
-            return None
+            return None, None
         try:
             data = json.loads(content[a : b + 1])
         except json.JSONDecodeError:
-            return None
+            return None, None
     if isinstance(data, dict):
-        value = data.get("translation")
-        if isinstance(value, str):
-            return value.strip()
-    return None
+        tr = data.get("translation")
+        if not isinstance(tr, str) or not tr.strip():
+            return None, None
+        src = data.get("source")
+        src = src.strip() if isinstance(src, str) and src.strip() else None
+        return tr.strip(), src
+    return None, None
 
 
 class OllamaTranslator:
@@ -181,6 +231,9 @@ class OllamaTranslator:
         context: list[ContextPair],
         glossary: dict[str, str],
         length_budget_s: float | None = None,
+        dialogue: list[DialogueLine] | None = None,
+        speaker: str | None = None,
+        upcoming: list[UpcomingLine] | None = None,
     ) -> str:
         messages = build_messages(
             text,
@@ -189,13 +242,47 @@ class OllamaTranslator:
             context=context,
             glossary=glossary,
             length_budget_s=length_budget_s,
+            dialogue=dialogue,
+            speaker=speaker,
+            upcoming=upcoming,
         )
+        return (await self._ask(messages, tgt))[0]
+
+    async def revise(
+        self,
+        text: str,
+        *,
+        src: str,
+        tgt: str,
+        context: list[ContextPair],
+        glossary: dict[str, str],
+        dialogue: list[DialogueLine] | None = None,
+        speaker: str | None = None,
+        upcoming: list[UpcomingLine] | None = None,
+    ) -> tuple[str, str | None]:
+        """2차 패스: 앞뒤 문맥으로 다시 번역하고 교정 원문도 받는다 → (번역, 교정 원문 또는 None)."""
+        messages = build_messages(
+            text,
+            src=src,
+            tgt=tgt,
+            context=context,
+            glossary=glossary,
+            dialogue=dialogue,
+            speaker=speaker,
+            upcoming=upcoming,
+            want_source=True,
+        )
+        return await self._ask(messages, tgt)
+
+    async def _ask(self, messages: list[dict[str, str]], tgt: str) -> tuple[str, str | None]:
+        """모델에 묻고 (번역, 교정 원문) 을 돌려준다. 형식·문자 체계가 어긋나면 한 번 고쳐 달라고 한다."""
+        why = "형식 오류"
         for attempt in range(2):
             content = await self._chat(messages)
-            out = parse_translation(content)
+            out, fixed = parse_result(content)
             problem = None if out is None else script_problem(out, tgt)
             if out is not None and problem is None:
-                return out
+                return out, fixed
             why = "형식 오류" if out is None else problem
             log.warning("Ollama 번역 %s (시도 %d): %r", why, attempt + 1, content[:120])
             fix = (

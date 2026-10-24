@@ -166,3 +166,123 @@ def test_utterance_mode_translation_without_speaker():
     _, events = run(mt, stream=False)
     trs = [e["payload"] for e in events if e["type"] == "translation.final"]
     assert trs and all("speaker" not in t for t in trs)
+
+
+class DialogueFakeTranslator(FakeTranslator):
+    """`dialogue`·`speaker` 를 받는 엔진 (Ollama 처럼). 세션이 최근 대화를 넘기는지 본다."""
+
+    async def translate(
+        self,
+        text,
+        *,
+        src,
+        tgt,
+        context,
+        glossary,
+        length_budget_s=None,
+        dialogue=None,
+        speaker=None,
+    ):
+        out = await super().translate(
+            text,
+            src=src,
+            tgt=tgt,
+            context=context,
+            glossary=glossary,
+            length_budget_s=length_budget_s,
+        )
+        self.calls[-1]["dialogue"] = list(dialogue or [])
+        self.calls[-1]["speaker"] = speaker
+        return out
+
+
+def test_session_passes_recent_dialogue_of_all_speakers_to_engine():
+    mt = DialogueFakeTranslator()
+    _, events = run(mt)
+    finals = [e["payload"] for e in events if e["type"] == "segment.final"]
+    assert len(mt.calls) >= 3
+    # S1 의 첫 발화(seg 1) 번역 때: 같은 화자 문맥은 비어 있지만 대화 문맥에는 S0 의 seg 0 이 있다
+    second = mt.calls[1]
+    assert second["context"] == [] and second["speaker"] == finals[1]["speaker"]
+    assert second["dialogue"] == [
+        (finals[0]["speaker"], finals[0]["text"], f"[ja->ko] {finals[0]['text']}")
+    ]
+    # 세 번째 호출은 앞의 두 줄을 순서대로 본다
+    assert [d[1] for d in mt.calls[2]["dialogue"]] == [finals[0]["text"], finals[1]["text"]]
+
+
+def test_engine_without_dialogue_parameter_still_works():
+    mt = FakeTranslator()  # translate 에 dialogue 인자가 없다 → 세션이 넘기지 않는다
+    _, events = run(mt)
+    assert [e for e in events if e["type"] == "translation.final"]
+    assert all("dialogue" not in c for c in mt.calls)
+
+
+class RevisingFakeTranslator(DialogueFakeTranslator):
+    """2차 패스(`revise`)를 지원하는 엔진: 번역을 '[rev]' 로, 원문의 '확정' 을 '교정' 으로 바꿔 돌려준다."""
+
+    def __init__(self, *, change=True):
+        super().__init__()
+        self.revise_calls = []
+        self.change = change
+
+    async def revise(
+        self, text, *, src, tgt, context, glossary, dialogue=None, speaker=None, upcoming=None
+    ):
+        self.revise_calls.append(
+            {"text": text, "speaker": speaker, "upcoming": list(upcoming or [])}
+        )
+        if not self.change:
+            return f"[{src}->{tgt}] {text}", text
+        return f"[rev] {text}", text.replace("확정", "교정")
+
+
+def _updates(events, kind):
+    return [e["payload"] for e in events if e["type"] == kind]
+
+
+def test_second_pass_revises_earlier_utterance_after_next_final():
+    mt = RevisingFakeTranslator()
+    _, events = run(mt)
+    finals = [e["payload"] for e in events if e["type"] == "segment.final"]
+    tr_updates = _updates(events, "translation.update")
+    src_updates = _updates(events, "segment.update")
+    assert len(finals) >= 2
+    first = finals[0]
+    # 첫 발화는 다음 발화 확정 뒤 2차 패스: 뒤 발화가 upcoming 으로 들어갔고, 번역·원문 갱신이 왔다
+    assert mt.revise_calls and mt.revise_calls[0]["upcoming"][0][1] == finals[1]["text"]
+    up = next(u for u in tr_updates if u["seg_id"] == first["seg_id"])
+    assert up["text"] == f"[rev] {first['text']}" and up["prev_text"] == f"[ja->ko] {first['text']}"
+    assert up["speaker"] == first["speaker"] and up["reason"] == "context"
+    su = next(u for u in src_updates if u["seg_id"] == first["seg_id"])
+    assert su["text"] == first["text"].replace("확정", "교정") and su["prev_text"] == first["text"]
+    # 갱신은 그 발화의 translation.final 뒤에 온다
+    i_final = next(
+        i
+        for i, e in enumerate(events)
+        if e["type"] == "translation.final" and e["payload"]["seg_id"] == first["seg_id"]
+    )
+    i_up = next(
+        i
+        for i, e in enumerate(events)
+        if e["type"] == "translation.update" and e["payload"]["seg_id"] == first["seg_id"]
+    )
+    assert i_final < i_up
+    # 마지막 발화는 뒤 문맥이 없어 2차 패스가 없다
+    last = finals[-1]
+    assert all(u["seg_id"] != last["seg_id"] for u in tr_updates + src_updates)
+    # 발화당 한 번만
+    assert len({c["text"] for c in mt.revise_calls}) == len(mt.revise_calls)
+
+
+def test_second_pass_emits_nothing_when_unchanged():
+    mt = RevisingFakeTranslator(change=False)
+    _, events = run(mt)
+    assert mt.revise_calls
+    assert not _updates(events, "translation.update") and not _updates(events, "segment.update")
+
+
+def test_engine_without_revise_skips_second_pass():
+    mt = DialogueFakeTranslator()
+    _, events = run(mt)
+    assert not _updates(events, "translation.update") and not _updates(events, "segment.update")

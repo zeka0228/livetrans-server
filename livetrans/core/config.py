@@ -146,6 +146,20 @@ class MtConfig(BaseModel):
     temperature: float = 0.1
     max_tokens: int = 200
     glossary: str | None = "config/glossary.yaml"  # + glossary.local.yaml (gitignore)
+    # 번역 프롬프트에 넣는 최근 대화 줄 수 (모든 화자, 원문 → 번역). 0 = 끔. 같은 화자 쌍(context_pairs)과 별개.
+    # 2026-10-25: 상대 화자 발화가 있어야 지시어·생략 주어·존댓말과 STT 오류(동음어)를 고칠 재료가 생긴다
+    dialogue_lines: int = 8
+    # 모드 A 룩어헤드: 번역 전에 뒤따르는 발화를 최대 lookahead_lines 개, 최대 lookahead_s 초 기다려 'upcoming' 으로 넣는다
+    # (앞뒤 문맥으로 동음어·끊긴 단어 교정). 기다림은 그 발화의 합성 데드라인(compose_wall − 예비 2.5 s) 안에서만.
+    # 모드 B·C(실시간 자막)는 적용 안 함. 0 이면 끔
+    lookahead_s: float = 3.0
+    lookahead_lines: int = 2
+    # 2차 패스: 첫 번역 때 뒤 문맥이 없었던 발화는 다음 발화가 확정되면 한 번 더 번역해(원문 교정 포함) 달라진 것만
+    # translation.update / segment.update 로 보낸다 (모드 A 는 합성 전 큐·TTS 교체). revise_window_s 지난 발화는 안 건드림.
+    # 원문 교정은 편집 비율(문자 편집 거리/길이)이 revise_max_edit 이하일 때만 받는다 (통째 바꿔 쓰기 방지)
+    revise: bool = True
+    revise_window_s: float = 10.0
+    revise_max_edit: float = 0.5
     # 추론(thinking) 모델의 사고 출력 끄기. 2026-10-25 벤치: qwen3:14b·gemma4 는 켜진 채로는 사고에 토큰을 다 써 40문장 중
     # 35~39개가 빈 출력(7 s), 끄면 0.3 s 에 정상 출력. 비추론 모델(gemma2 등)에는 영향 없음
     think: bool = False

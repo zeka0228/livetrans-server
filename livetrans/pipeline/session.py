@@ -44,7 +44,7 @@ from livetrans.pipeline.lanes import LanePartial, LaneSegmenter, LaneUtterance
 from livetrans.pipeline.segmenter import PartialRequest, Segmenter, SpeechSegment
 from livetrans.pipeline.timeline import Composer, DeadlineEvent, OutputRing, Timeline
 from livetrans.plugins.diar.base import Diarizer
-from livetrans.plugins.mt import FallbackTranslator, load_glossary
+from livetrans.plugins.mt import FallbackTranslator, context_kwargs, load_glossary
 from livetrans.plugins.mt.base import Translation, TranslationError, Translator
 from livetrans.plugins.source.base import Source
 from livetrans.plugins.source.loopback import CaptureError
@@ -58,6 +58,9 @@ LANG_CONFIDENT = 0.7  # 자동 감지 확률이 이보다 낮으면 최근 다�
 LANG_VOTES = 10
 LANG_MIN_VOTES = 3
 REPEAT_SUPPRESS_MAX_MS = 1500  # 직전 문장과 같은 결과를 비우는 발화 길이 상한
+# 룩어헤드 대기 뒤 번역(≈0.3 s)+TTS(≈1.5 s) 가 세그먼트 합성 전에 끝나도록 남기는 여유
+LOOKAHEAD_RESERVE_S = 2.5
+MT_SEEN_MAX = 32  # 룩어헤드용 최근 확정 발화 기억 수
 
 
 def final_payload(
@@ -100,6 +103,30 @@ def _wav_to_float(data: bytes) -> tuple[np.ndarray, int]:
         if w.getnchannels() > 1:
             pcm = pcm.reshape(-1, w.getnchannels()).mean(axis=1)
     return pcm, sr
+
+
+def _norm_text(s: str) -> str:
+    return "".join(ch for ch in s.lower() if not ch.isspace() and ch not in ".,!?、。「」\"'…:;()")
+
+
+def _changed(a: str, b: str) -> bool:
+    return _norm_text(a) != _norm_text(b)
+
+
+def _acceptable_fix(orig: str, fixed: str, max_ratio: float) -> bool:
+    """원문 교정이 '고침' 수준인지 (통째 바꿔 쓰기 방지): 길이 비 0.5~1.6, 문자 편집 거리/길이 ≤ max_ratio."""
+    a, b = _norm_text(orig), _norm_text(fixed)
+    if not a or not b:
+        return False
+    if not 0.5 <= len(b) / len(a) <= 1.6:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1] / max(len(a), len(b)) <= max_ratio
 
 
 class Session:
@@ -154,6 +181,17 @@ class Session:
             asyncio.Queue()
         )
         self._mt_context: dict[str | None, deque[tuple[str, str]]] = {}
+        # 최근 대화 (모든 화자: 화자, 원문, 번역) — 번역 프롬프트의 대화 문맥 (mt.dialogue_lines, 0 = 끔)
+        self._dialogue: deque[tuple[str | None, str, str]] = deque(
+            maxlen=max(1, settings.mt.dialogue_lines)
+        )
+        self._dialogue_on = settings.mt.dialogue_lines > 0
+        # 룩어헤드 (모드 A): 큐에 들어온 확정 발화 (seg_id, 화자, 원문) 순서 기록 + 새 발화 알림
+        self._mt_seen: deque[tuple[int, str | None, str]] = deque(maxlen=MT_SEEN_MAX)
+        self._mt_new = asyncio.Event()
+        # 2차 패스 (mt.revise): 1차 번역 기록 (seg_id, 화자) → 정보. 뒤 문맥 없이 번역된 것만 다음 발화 확정 뒤 한 번 더
+        self._mt_done: dict[tuple[int, str | None], dict] = {}
+        self._revise_queue: asyncio.Queue[tuple[int, str | None] | None] = asyncio.Queue()
         self._glossary_cache: dict[str, dict[str, str]] = {}
         self._max_speakers_per_seg = settings.diar.max_speakers_per_seg
         # 캡처·스트림 소스는 control start 때 켠다 (그 전 소리는 받지 않음). 마이크는 앱이 보내는 대로 받는다.
@@ -224,6 +262,7 @@ class Session:
             asyncio.create_task(self._ingest_loop(), name=f"ingest-{self.session_id}"),
             asyncio.create_task(self._stt_loop(), name=f"stt-{self.session_id}"),
             asyncio.create_task(self._mt_loop(), name=f"mt-{self.session_id}"),
+            asyncio.create_task(self._revise_loop(), name=f"revise-{self.session_id}"),
         ]
         self._emit_state("starting")
 
@@ -450,9 +489,18 @@ class Session:
         self._deadline(self.composer.add_cue(seg_id, kind, t_start_ms, t_end_ms, text, speaker))
 
     async def _synthesize_for_timeline(
-        self, seg_id: int, speaker: str | None, text: str, lang: str, t_start_ms: int, t_end_ms: int
+        self,
+        seg_id: int,
+        speaker: str | None,
+        text: str,
+        lang: str,
+        t_start_ms: int,
+        t_end_ms: int,
+        *,
+        replace: bool = False,
     ) -> None:
-        """번역문을 TTS 로 합성해 타임라인에 놓는다 (`tts.ready`). 슬롯보다 길면 배속(≤ max_rate)으로 다시 합성."""
+        """번역문을 TTS 로 합성해 타임라인에 놓는다 (`tts.ready`). 슬롯보다 길면 배속(≤ max_rate)으로 다시 합성.
+        `replace` 면 2차 패스: 아직 합성 전인 같은 발화의 클립을 바꾸고, 이미 나갔으면 아무것도 안 한다."""
         if self.composer is None or self.voices is None or not text:
             return
         t0 = time.perf_counter()
@@ -475,7 +523,11 @@ class Session:
         pcm48 = resample_linear(pcm, sr, OUT_RATE)
         tts_ms = int((time.perf_counter() - t0) * 1000)
         self._lat["tts"].append(tts_ms)
-        self._deadline(self.composer.add_tts(seg_id, t_start_ms, pcm48, speaker))
+        if replace:
+            if not self.composer.replace_tts(seg_id, speaker, pcm48):
+                return  # 이미 합성에 실린 클립: 자막만 바뀌고 소리는 그대로
+        else:
+            self._deadline(self.composer.add_tts(seg_id, t_start_ms, pcm48, speaker))
         payload = {
             "seg_id": seg_id,
             "duration_ms": len(pcm48) * 1000 // OUT_RATE,
@@ -504,6 +556,7 @@ class Session:
 
     async def _stop(self) -> None:
         self._closing = True
+        self._mt_new.set()
         await self.source.stop()
         self._flush_fast = True  # 모드 A: 남은 세그먼트를 바로 흘려 보낸다
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -522,6 +575,7 @@ class Session:
     async def abort(self) -> None:
         """연결이 끊겨 결과를 받을 곳이 없을 때: 남은 작업을 버린다."""
         self._closing = True
+        self._mt_new.set()
         await self.source.stop()
         for t in self._tasks:
             t.cancel()
@@ -770,6 +824,7 @@ class Session:
                 await self._run_partial(req)
             elif self._ingest_done:
                 self._mt_queue.put_nowait(None)  # STT 끝 → 번역 루프도 남은 것만 처리하고 끝낸다
+                self._mt_new.set()  # 룩어헤드 대기 중이면 바로 번역하게
                 return
             else:
                 await self._wake.wait()
@@ -851,9 +906,28 @@ class Session:
         while True:
             item = await self._mt_queue.get()
             if item is None:
+                self._revise_queue.put_nowait(
+                    None
+                )  # 번역이 끝나면 2차 패스도 남은 것만 하고 끝낸다
                 return
             seg_id, speaker, text, lang, t_start_ms, t_end_ms = item
-            tr = await self._translate_one(seg_id, speaker, text, lang)
+            upcoming = await self._wait_lookahead(seg_id, t_start_ms)
+            tr = await self._translate_one(seg_id, speaker, text, lang, upcoming=upcoming)
+            if tr is not None and self._mt_cfg.revise:
+                self._mt_done[(seg_id, speaker)] = {
+                    "speaker": speaker,
+                    "text": text,
+                    "src": tr.src_lang,
+                    "translation": tr.text,
+                    "t_start_ms": t_start_ms,
+                    "t_end_ms": t_end_ms,
+                    "upcoming_n": len(upcoming or []),
+                    "at": time.time(),
+                    "revised": False,
+                }
+                if len(self._mt_done) > MT_SEEN_MAX:
+                    self._mt_done.pop(next(iter(self._mt_done)))
+                self._schedule_revisions(exclude=(seg_id, speaker))  # 이미 뒤 발화가 와 있으면 바로
             if tr is not None and self.mode == "A":
                 self._add_cue("tgt", seg_id, t_start_ms, t_end_ms, tr.text, speaker)
                 if self.tts_enabled and tr.text and tr.src_lang != tr.tgt_lang:
@@ -871,7 +945,128 @@ class Session:
         t_end_ms: int = 0,
     ) -> None:
         if text:
+            self._mt_seen.append((seg_id, speaker, text))
             self._mt_queue.put_nowait((seg_id, speaker, text, lang, t_start_ms, t_end_ms))
+            self._mt_new.set()
+            self._schedule_revisions(exclude=(seg_id, speaker))
+
+    def _schedule_revisions(self, *, exclude: tuple[int, str | None]) -> None:
+        """새 발화가 확정됐다: 뒤 문맥 없이 번역된 최근 발화를 2차 패스 큐에 넣는다 (발화당 한 번)."""
+        if not self._mt_cfg.revise or self.translator is None:
+            return
+        now = time.time()
+        for key, rec in list(self._mt_done.items()):
+            if key == exclude or rec["revised"] or rec["upcoming_n"] > 0:
+                continue
+            if now - rec["at"] > self._mt_cfg.revise_window_s:
+                continue
+            rec["revised"] = True
+            self._revise_queue.put_nowait(key)
+
+    async def _revise_loop(self) -> None:
+        while True:
+            key = await self._revise_queue.get()
+            if key is None or self._closing:
+                return
+            rec = self._mt_done.get(key)
+            if rec is None:
+                continue
+            try:
+                await self._revise_one(key[0], rec)
+            except Exception:  # 2차 패스 실패는 1차 결과를 그대로 둔다
+                log.debug("2차 패스 실패 seg=%s", key[0], exc_info=True)
+
+    async def _revise_one(self, seg_id: int, rec: dict) -> None:
+        """앞뒤 문맥으로 다시 번역·원문 교정. 달라진 것만 `translation.update`/`segment.update` 로 보내고,
+        모드 A 는 아직 합성 전인 큐(·TTS)를 바꾼다."""
+        revise = getattr(self.translator, "revise", None)
+        if revise is None:
+            return
+        upcoming = self._following(seg_id, max(1, self._mt_cfg.lookahead_lines))
+        if not upcoming:
+            return
+        speaker, text, src = rec["speaker"], rec["text"], rec["src"]
+        tgt = self.tgt_lang
+        result = await revise(
+            text,
+            src=src,
+            tgt=tgt,
+            context=list(self._mt_context.get(speaker, ())),
+            glossary=self._glossary(src) if src != tgt else {},
+            dialogue=list(self._dialogue) if self._dialogue_on else None,
+            speaker=speaker,
+            upcoming=upcoming,
+        )
+        if result is None:
+            return
+        new_tr, fixed_src = result
+        base = {"seg_id": seg_id, "reason": "context"}
+        if speaker is not None:
+            base["speaker"] = speaker
+        # ① 원문 교정 (같은 언어면 모델의 '번역' 이 곧 교정문)
+        if src == tgt and not fixed_src:
+            fixed_src = new_tr
+        if (
+            fixed_src
+            and _changed(text, fixed_src)
+            and _acceptable_fix(text, fixed_src, self._mt_cfg.revise_max_edit)
+        ):
+            self._emit("segment.update", {**base, "text": fixed_src, "prev_text": text})
+            if self.composer is not None:
+                self.composer.replace_cue(seg_id, "src", speaker, fixed_src)
+            rec["text"] = fixed_src
+        # ② 번역 교정 (다른 언어일 때)
+        if src != tgt and new_tr and _changed(rec["translation"], new_tr):
+            prev = rec["translation"]
+            self._emit("translation.update", {**base, "text": new_tr, "prev_text": prev})
+            rec["translation"] = new_tr
+            if self.composer is not None:
+                replaced = self.composer.replace_cue(seg_id, "tgt", speaker, new_tr)
+                if replaced and self.tts_enabled:  # 자막을 바꿨고 아직 합성 전이면 소리도 다시
+                    await self._synthesize_for_timeline(
+                        seg_id,
+                        speaker,
+                        new_tr,
+                        tgt,
+                        rec["t_start_ms"],
+                        rec["t_end_ms"],
+                        replace=True,
+                    )
+
+    def _following(self, seg_id: int, n: int) -> list[tuple[str | None, str]]:
+        """seg_id 뒤에 확정된 발화 (화자, 원문) 최대 n개 — 번역 프롬프트의 'upcoming'."""
+        out: list[tuple[str | None, str]] = []
+        found = False
+        for sid, spk, txt in self._mt_seen:
+            if found:
+                out.append((spk, txt))
+                if len(out) >= n:
+                    break
+            elif sid == seg_id:
+                found = True
+        return out
+
+    async def _wait_lookahead(self, seg_id: int, t_start_ms: int) -> list[tuple[str | None, str]]:
+        """모드 A: 뒤 발화가 lookahead_lines 개 모이거나, lookahead_s 또는 합성 데드라인(−예비)에 닿을 때까지 기다린다.
+
+        실시간 자막(모드 B·C)은 기다리지 않는다. 입력이 끝나거나 세션이 닫히면 바로 돌아온다.
+        """
+        n = self._mt_cfg.lookahead_lines
+        if n <= 0 or self._mt_cfg.lookahead_s <= 0 or self.mode != "A" or self.timeline is None:
+            return self._following(seg_id, n) if n > 0 else []
+        tl = self.timeline
+        deadline = tl.compose_wall(tl.segment_of(t_start_ms)) - LOOKAHEAD_RESERVE_S
+        stop_at = min(time.time() + self._mt_cfg.lookahead_s, deadline)
+        while len(self._following(seg_id, n)) < n and not self._ingest_done and not self._closing:
+            remaining = stop_at - time.time()
+            if remaining <= 0:
+                break
+            self._mt_new.clear()
+            try:
+                await asyncio.wait_for(self._mt_new.wait(), remaining)
+            except TimeoutError:
+                break
+        return self._following(seg_id, n)
 
     def _glossary(self, src: str) -> dict[str, str]:
         key = f"{src}->{self.tgt_lang}"
@@ -880,7 +1075,12 @@ class Session:
         return self._glossary_cache[key]
 
     async def _translate_one(
-        self, seg_id: int, speaker: str | None, text: str, lang: str
+        self,
+        seg_id: int,
+        speaker: str | None,
+        text: str,
+        lang: str,
+        upcoming: list[tuple[str | None, str]] | None = None,
     ) -> Translation | None:
         src = (lang or "").split("-")[0].lower()
         if self.translator is None or not src or src == self.tgt_lang:
@@ -892,6 +1092,7 @@ class Session:
             context = list(self._mt_context.get(speaker, ()))
             glossary = self._glossary(src)
             try:
+                dialogue = list(self._dialogue) if self._dialogue_on else None
                 if isinstance(self.translator, FallbackTranslator):
                     tr = await self.translator.translate_full(
                         seg_id,
@@ -901,11 +1102,21 @@ class Session:
                         context=context,
                         glossary=glossary,
                         speaker=speaker,
+                        dialogue=dialogue,
+                        upcoming=upcoming,
                     )
                 else:
                     t0 = asyncio.get_running_loop().time()
+                    extra = context_kwargs(
+                        self.translator, dialogue=dialogue, speaker=speaker, upcoming=upcoming
+                    )
                     out = await self.translator.translate(
-                        text, src=src, tgt=self.tgt_lang, context=context, glossary=glossary
+                        text,
+                        src=src,
+                        tgt=self.tgt_lang,
+                        context=context,
+                        glossary=glossary,
+                        **extra,
                     )
                     tr = Translation(
                         seg_id,
@@ -926,6 +1137,9 @@ class Session:
             if tr.text and tr.engine != "passthrough":
                 ctx = self._mt_context.setdefault(speaker, deque(maxlen=self._mt_cfg.context_pairs))
                 ctx.append((text, tr.text))
+        if tr.text and self._dialogue_on:
+            # 같은 언어(원문 통과)도 대화 문맥에는 넣는다
+            self._dialogue.append((speaker, text, tr.text))
         payload = {
             "seg_id": tr.seg_id,
             "text": tr.text,
