@@ -140,21 +140,21 @@ def test_build_messages_lists_hypotheses_and_uncertain_words_and_asks_confidence
         uncertain_words=["캐"],
     )
     system = msgs[0]["content"]
-    assert (
-        "alternative transcriptions" in system
-        and "1) 그 키 어디 있어" in system
-        and "2) 그 캐 어디 있어" in system
-    )
+    assert "candidate transcriptions" in system and "regardless of order" in system
+    # 후보는 사용자 턴에 목록으로 (시스템 메시지 + 1번 사용자 턴이면 모델이 1번에 고착 — 2026-10-25 실험)
+    assert msgs[-1]["role"] == "user"
+    assert "1) 그 키 어디 있어" in msgs[-1]["content"]
+    assert "2) 그 캐 어디 있어" in msgs[-1]["content"]
     assert 'Low-confidence words in the current line: "캐"' in system
     assert (
         '"confidence": <0-1>' in system and '"source"' in system
     )  # 후보가 있으면 원문·확신도도 요청
-    plain = build_messages("hi", src="en", tgt="ko", context=[], glossary={})[0]["content"]
-    assert "alternative transcriptions" not in plain and "confidence" not in plain
-    one = build_messages("hi", src="en", tgt="ko", context=[], glossary={}, hypotheses=["hi"])[0][
-        "content"
-    ]
-    assert "alternative transcriptions" not in one  # 후보가 하나뿐이면 재채점 블록 없음
+    plain = build_messages("hi", src="en", tgt="ko", context=[], glossary={})
+    assert "candidate transcriptions" not in plain[0]["content"]
+    assert "confidence" not in plain[0]["content"] and plain[-1]["content"] == "hi"
+    one = build_messages("hi", src="en", tgt="ko", context=[], glossary={}, hypotheses=["hi"])
+    assert "candidate transcriptions" not in one[0]["content"]  # 후보 하나면 평소대로
+    assert one[-1]["content"] == "hi"
 
 
 def test_parse_translation_accepts_json_and_rejects_garbage():

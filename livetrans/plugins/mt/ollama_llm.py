@@ -105,12 +105,16 @@ def build_messages(
     if length_budget_s:
         system += f" The translation will be spoken aloud in about {length_budget_s:.0f} seconds, so keep it short."
     rescoring = bool(hypotheses and len(hypotheses) > 1) or bool(uncertain_words)
-    if hypotheses and len(hypotheses) > 1:
-        listed = "\n".join(f"{i}) {_clip(h)}" for i, h in enumerate(hypotheses[:MAX_HYPOTHESES], 1))
+    candidates = hypotheses[:MAX_HYPOTHESES] if hypotheses and len(hypotheses) > 1 else None
+    if candidates:
+        # 후보는 사용자 턴에 목록으로 준다 (아래). 시스템 메시지에 두고 1번을 사용자 턴으로 주면 모델이 사용자 턴을
+        # '정답'으로 고착해 문맥상 틀린 후보를 그대로 둔다 (2026-10-25 gemma4 실험: 5문장 중 2 → 6문장 중 5 정답)
         system += (
-            " The speech recognizer was unsure; alternative transcriptions of the current line, most likely "
-            f"first:\n{listed}\nPick the reading that is most plausible in this conversation (prefer 1 unless "
-            "the context clearly favors another) and translate that reading."
+            " The recognizer was unsure about this line and produced several candidate transcriptions; they "
+            "differ exactly where it was unsure. Decide which candidate is what the speaker most likely said, "
+            "judging by meaning, common collocations and the conversation (a candidate that makes sense in "
+            "context beats one that does not, regardless of order). Then translate that candidate and return it "
+            'verbatim as "source".'
         )
     if uncertain_words:
         system += (
@@ -136,7 +140,13 @@ def build_messages(
         messages.append(
             {"role": "assistant", "content": json.dumps({"translation": t}, ensure_ascii=False)}
         )
-    messages.append({"role": "user", "content": text})
+    if candidates:
+        listed = "\n".join(f"{i}) {_clip(h)}" for i, h in enumerate(candidates, 1))
+        messages.append(
+            {"role": "user", "content": f"Candidate transcriptions of the current line:\n{listed}"}
+        )
+    else:
+        messages.append({"role": "user", "content": text})
     return messages
 
 
