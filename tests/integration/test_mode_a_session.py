@@ -80,19 +80,22 @@ async def drain(session: Session) -> list[dict]:
     return events
 
 
-async def run_mode_a(audio_seconds=4.5, delay=2.0, holdback=0.5, tts=True):
+async def run_mode_a(
+    audio_seconds=4.5, delay=2.0, holdback=0.5, tts=True, translator=None, audio=None
+):
     settings = Settings(
         stt=SttConfig(engine="fake"), timeline=TimelineConfig(holdback_s=holdback, max_lag_s=4.0)
     )
     settings.tts.defaults = {"ko-KR": "fake:auto"}
     voices = VoiceRegistry({"fake": FakeTTS()}, settings.tts.defaults)
     await voices.refresh()
-    audio = np.concatenate([silence(0.5), tone(1.5), silence(0.8), tone(0.8), silence(0.9)])
+    if audio is None:
+        audio = np.concatenate([silence(0.5), tone(1.5), silence(0.8), tone(0.8), silence(0.9)])
     audio = audio[: int(audio_seconds * 16000)]
     source = FakeLiveSource(audio)
     hls = FakeHls()
     stt = FakeSTT(lang="ja")
-    mt = FakeTranslator()
+    mt = translator or FakeTranslator()
     session = Session(
         settings,
         stt,
@@ -224,3 +227,57 @@ async def test_mode_a_timeline_compose_times(delay):
     await session.stop()
     live = [(k, t) for k, t in stamped if tl.compose_wall(k) <= t <= tl.compose_wall(k) + 0.6]
     assert len(live) >= 2, stamped  # 입력 중 합성된 것은 제시간에
+
+
+class LookaheadFakeTranslator(FakeTranslator):
+    """`upcoming` 을 받는 엔진 (Ollama 처럼): 모드 A 룩어헤드가 뒤 발화를 넘기는지 본다."""
+
+    async def translate(
+        self, text, *, src, tgt, context, glossary, length_budget_s=None, upcoming=None, **_
+    ):
+        out = await super().translate(
+            text,
+            src=src,
+            tgt=tgt,
+            context=context,
+            glossary=glossary,
+            length_budget_s=length_budget_s,
+        )
+        self.calls[-1]["upcoming"] = list(upcoming or [])
+        self.calls[-1]["at"] = time.time()
+        return out
+
+
+async def test_mode_a_lookahead_passes_following_utterance_within_deadline():
+    """룩어헤드: 첫 발화 번역은 뒤 발화(0.8 s 뒤 시작)가 확정될 때까지 기다렸다가 그것을 upcoming 으로 받는다.
+    마지막 발화는 입력이 끝나면 바로 번역된다 (lookahead_s 3 s 를 다 기다리지 않음). D=8 이라 데드라인 여유가 있다."""
+    mt = LookaheadFakeTranslator()
+    audio = np.concatenate([silence(0.5), tone(1.5), silence(0.8), tone(0.8), silence(0.9)])
+    _session, events, _hls, _stt, _mt, _t0 = await run_mode_a(
+        audio_seconds=4.5, delay=8.0, translator=mt, audio=audio
+    )
+    finals = [e["payload"] for e in events if e["type"] == "segment.final"]
+    trs = [e["payload"] for e in events if e["type"] == "translation.final"]
+    assert len(finals) >= 2 and len(trs) == len(finals)
+    first, last = mt.calls[0], mt.calls[-1]
+    assert first["upcoming"] and first["upcoming"][0][1] == finals[1]["text"]
+    assert last["upcoming"] == []
+    # 첫 번역은 두 번째 발화 확정 뒤에 일어났다 (기다렸다는 증거)
+    second_final_at = (
+        next(
+            e["ts_wall_ms"]
+            for e in events
+            if e["type"] == "segment.final" and e["payload"]["seg_id"] == finals[1]["seg_id"]
+        )
+        / 1000
+    )
+    assert first["at"] >= second_final_at - 0.05
+
+
+async def test_mode_a_lookahead_does_not_wait_when_deadline_is_near():
+    """D 가 작아 합성 데드라인까지 여유가 없으면 기다리지 않고 바로 번역한다 (upcoming 비어 있음)."""
+    mt = LookaheadFakeTranslator()
+    _session, events, *_ = await run_mode_a(audio_seconds=4.5, delay=2.0, translator=mt)
+    finals = [e["payload"] for e in events if e["type"] == "segment.final"]
+    assert len(finals) >= 2
+    assert mt.calls[0]["upcoming"] == []

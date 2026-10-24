@@ -133,6 +133,11 @@ class MtConfig(BaseModel):
     # 번역 프롬프트에 넣는 최근 대화 줄 수 (모든 화자, 원문 → 번역). 0 = 끔. 같은 화자 쌍(context_pairs)과 별개.
     # 2026-10-25: 상대 화자 발화가 있어야 지시어·생략 주어·존댓말과 STT 오류(동음어)를 고칠 재료가 생긴다
     dialogue_lines: int = 8
+    # 모드 A 룩어헤드: 번역 전에 뒤따르는 발화를 최대 lookahead_lines 개, 최대 lookahead_s 초 기다려 'upcoming' 으로 넣는다
+    # (앞뒤 문맥으로 동음어·끊긴 단어 교정). 기다림은 그 발화의 합성 데드라인(compose_wall − 예비 2.5 s) 안에서만.
+    # 모드 B·C(실시간 자막)는 적용 안 함. 0 이면 끔
+    lookahead_s: float = 3.0
+    lookahead_lines: int = 2
 
 
 class LoggingConfig(BaseModel):

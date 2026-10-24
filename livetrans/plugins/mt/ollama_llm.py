@@ -40,7 +40,9 @@ LANG_NAMES = {
 
 
 DialogueLine = tuple[str | None, str, str]  # (화자, 원문, 번역)
+UpcomingLine = tuple[str | None, str]  # (화자, 원문) — 아직 번역 안 된 뒤 발화
 MAX_DIALOGUE_LINES = 12
+MAX_UPCOMING_LINES = 3
 
 
 def _clip(s: str, n: int = 80) -> str:
@@ -61,6 +63,7 @@ def build_messages(
     length_budget_s: float | None = None,
     dialogue: list[DialogueLine] | None = None,
     speaker: str | None = None,
+    upcoming: list[UpcomingLine] | None = None,
 ) -> list[dict[str, str]]:
     """Ollama chat 메시지. 같은 화자의 문맥 쌍은 (user 원문 → assistant JSON) 대화로 넣어 모델이 형식을 따라가게 하고,
     최근 대화(모든 화자)는 시스템 메시지에 "화자: 원문 -> 번역" 줄로 넣는다 (지시어·생략 주어·STT 오류 교정 재료)."""
@@ -81,6 +84,15 @@ def build_messages(
         )
         system += " Recent dialogue, oldest first (speaker: original -> translation):\n"
         system += f"{shown}\n{tag}"
+    if upcoming:
+        nxt = "\n".join(
+            f"{who or 'speaker'}: {_clip(s)}" for who, s in upcoming[:MAX_UPCOMING_LINES]
+        )
+        system += (
+            " Lines spoken right after the current utterance (not yet translated). Use them only to "
+            "disambiguate words and fix recognition errors in the current line; never translate or merge "
+            f"them into the output:\n{nxt}\n"
+        )
     if glossary:
         pairs = "; ".join(f"{k} -> {v}" for k, v in list(glossary.items())[:60])
         system += f" Use these fixed translations when the term appears: {pairs}."
@@ -189,6 +201,7 @@ class OllamaTranslator:
         length_budget_s: float | None = None,
         dialogue: list[DialogueLine] | None = None,
         speaker: str | None = None,
+        upcoming: list[UpcomingLine] | None = None,
     ) -> str:
         messages = build_messages(
             text,
@@ -199,6 +212,7 @@ class OllamaTranslator:
             length_budget_s=length_budget_s,
             dialogue=dialogue,
             speaker=speaker,
+            upcoming=upcoming,
         )
         for attempt in range(2):
             content = await self._chat(messages)

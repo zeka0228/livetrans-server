@@ -59,19 +59,36 @@ def load_glossary(path: str | Path | None, src: str, tgt: str) -> dict[str, str]
     return merged
 
 
-def accepts_dialogue(engine) -> bool:
-    """엔진의 translate 가 `dialogue` 인자를 받는지 (Ollama 는 받고, passthrough·테스트 가짜는 안 받을 수 있다)."""
-    cached = getattr(engine, "_accepts_dialogue", None)
+def _translate_params(engine) -> frozenset[str]:
+    """엔진 translate 의 키워드 인자 이름 (1회 검사·캐시). passthrough·테스트 가짜는 문맥 인자를 안 받을 수 있다."""
+    cached = getattr(engine, "_translate_params", None)
     if cached is None:
         try:
-            cached = "dialogue" in inspect.signature(engine.translate).parameters
+            cached = frozenset(inspect.signature(engine.translate).parameters)
         except (TypeError, ValueError):
-            cached = False
+            cached = frozenset()
         try:
-            engine._accepts_dialogue = cached
+            engine._translate_params = cached
         except AttributeError:
             pass
     return cached
+
+
+def accepts_dialogue(engine) -> bool:
+    return "dialogue" in _translate_params(engine)
+
+
+def context_kwargs(engine, *, dialogue, speaker, upcoming) -> dict:
+    """엔진이 받는 문맥 인자만 골라 넘긴다 (dialogue·speaker·upcoming)."""
+    params = _translate_params(engine)
+    out: dict = {}
+    if "dialogue" in params:
+        out["dialogue"] = dialogue
+        if "speaker" in params:
+            out["speaker"] = speaker
+    if "upcoming" in params:
+        out["upcoming"] = upcoming
+    return out
 
 
 class FallbackTranslator:
@@ -117,6 +134,7 @@ class FallbackTranslator:
         length_budget_s: float | None = None,
         dialogue: list | None = None,
         speaker: str | None = None,
+        upcoming: list | None = None,
     ) -> str:
         return (
             await self.translate_full(
@@ -129,6 +147,7 @@ class FallbackTranslator:
                 length_budget_s=length_budget_s,
                 speaker=speaker,
                 dialogue=dialogue,
+                upcoming=upcoming,
             )
         ).text
 
@@ -144,12 +163,13 @@ class FallbackTranslator:
         length_budget_s: float | None = None,
         speaker: str | None = None,
         dialogue: list | None = None,
+        upcoming: list | None = None,
     ) -> Translation:
         t0 = time.perf_counter()
         last: Exception | None = None
         for i, e in enumerate(self.active):
             try:
-                extra = {"dialogue": dialogue, "speaker": speaker} if accepts_dialogue(e) else {}
+                extra = context_kwargs(e, dialogue=dialogue, speaker=speaker, upcoming=upcoming)
                 out = await e.translate(
                     text,
                     src=src,

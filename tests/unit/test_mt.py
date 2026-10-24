@@ -51,6 +51,26 @@ def test_build_messages_puts_dialogue_and_correction_instruction_in_system():
     assert "Recent dialogue" not in plain[0]["content"]
 
 
+def test_build_messages_adds_upcoming_lines_for_disambiguation_only():
+    msgs = build_messages(
+        "그 키 어디 있어",
+        src="ko",
+        tgt="en",
+        context=[],
+        glossary={},
+        upcoming=[("S1", "파란 열쇠 말이야?"), ("S0", "응 상자 열 때 쓰는 거")],
+    )
+    system = msgs[0]["content"]
+    assert "spoken right after the current utterance" in system
+    assert "S1: 파란 열쇠 말이야?" in system and "S0: 응 상자 열 때 쓰는 거" in system
+    assert "never translate or merge" in system
+    assert msgs[-1]["content"] == "그 키 어디 있어"
+    assert (
+        "spoken right after"
+        not in build_messages("hi", src="en", tgt="ko", context=[], glossary={})[0]["content"]
+    )
+
+
 def test_parse_translation_accepts_json_and_rejects_garbage():
     assert parse_translation('{"translation": "안녕"}') == "안녕"
     assert parse_translation('Sure! {"translation": "안녕"} ok') == "안녕"
