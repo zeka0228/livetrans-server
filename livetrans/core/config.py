@@ -89,6 +89,9 @@ class TimelineConfig(BaseModel):
     guard_s: float = 1.0  # G
     default_delay_s: int = 36  # D 기본 (D-022 최악 가정). 테스트는 요청에서 작게
     ring_extra_s: float = 30.0  # 원본 출력 링버퍼 여유
+    # control start 뒤 첫 입력 소리가 이 시간 안에 안 오면 E_CAPTURE_START 로 끝낸다. SRT listener 는 OBS 가 붙을 때까지
+    # 소리가 없으므로, 타임라인(D)은 첫 소리가 도착한 순간부터 센다 (ERR-011)
+    input_wait_s: float = 90.0
     max_lag_s: float = (
         8.0  # 결과가 이보다 늦으면 버림 (L3). L_max(8 s) 발화가 D 부족 시에도 버려지지 않게
     )

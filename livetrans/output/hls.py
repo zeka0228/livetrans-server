@@ -37,6 +37,20 @@ CONTENT_TYPES = {
 }
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    """플레이리스트를 임시 파일에 쓴 뒤 바꿔 넣는다 — 읽는 쪽(플레이어 폴링)이 반쯤 쓰인 파일을 보지 않게.
+
+    Windows 는 다른 핸들이 열어 둔 파일 위로 바꿔 넣지 못할 수 있어(PermissionError) 그때만 제자리에 쓴다.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        tmp.replace(path)
+    except PermissionError:
+        path.write_text(text, encoding="utf-8")
+        tmp.unlink(missing_ok=True)
+
+
 def find_ffmpeg(configured: str | None) -> str | None:
     """설정값 → PATH → 흔한 설치 위치 순으로 ffmpeg 실행 파일을 찾는다."""
     for cand in (configured, "ffmpeg"):
@@ -218,13 +232,13 @@ class HlsWriter:
         else:
             lines.append('#EXT-X-STREAM-INF:BANDWIDTH=200000,CODECS="mp4a.40.2",SUBTITLES="subs"')
         lines.append("media.m3u8")
-        (self.dir / "master.m3u8").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        write_text_atomic(self.dir / "master.m3u8", "\n".join(lines) + "\n")
 
     def _write_vtt(self, kind: str, k: int, cues: list[Cue]) -> None:
         if self._mpegts_offset is None:
             self._mpegts_offset = self._probe_offset()
         path = self.dir / f"sub_{kind}_{k:05d}.vtt"
-        path.write_text(vtt_segment(cues, mpegts_offset=self._mpegts_offset or 0), encoding="utf-8")
+        write_text_atomic(path, vtt_segment(cues, mpegts_offset=self._mpegts_offset or 0))
         seq = self._vtt_seq[kind]
         seq.append((k, path))
         while len(seq) > self.list_size:
@@ -245,7 +259,7 @@ class HlsWriter:
             lines += [f"#EXTINF:{self.segment_s:.3f},", path.name]
         if end:
             lines.append("#EXT-X-ENDLIST")
-        (self.dir / f"sub_{kind}.m3u8").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        write_text_atomic(self.dir / f"sub_{kind}.m3u8", "\n".join(lines) + "\n")
 
     def _probe_offset(self) -> int | None:
         """첫 미디어 세그먼트의 start_time(초) → MPEGTS 90 kHz 틱. 아직 없으면 None (다음 세그먼트에서 다시)."""
