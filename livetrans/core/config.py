@@ -48,10 +48,9 @@ class SttConfig(BaseModel):
     )
     rescue_model: str = "large-v3"
     # 언어별 라우팅 (세션 요청 stt.engine 이 "auto" 일 때): 지정/감지 언어 → 엔진 이름. 그 엔진이 기본 또는 구조 엔진으로
-    # 떠 있을 때만 적용된다. 2026-10-25: DiCoW(영어 중심 미세조정)가 빠뜨린 한국어 구절을 faster-whisper 는 잡아서 ko·ja 는 fw 로
-    route_by_lang: dict[str, str] = Field(
-        default_factory=lambda: {"ko": "faster_whisper", "ja": "faster_whisper"}
-    )
+    # 떠 있을 때만 적용된다. 2026-10-25 벤치: 한국어는 DiCoW 가 CER 0.011 vs fw 0.046 에 2배 빠르고 화자 마스크도 되어 유지,
+    # 일본어는 DiCoW 가 언어를 en 으로 오판(5건 중 3건 → 번역 src 가 틀어짐)해 fw 로. 일본어 방송은 src_lang=ja 지정 권장
+    route_by_lang: dict[str, str] = Field(default_factory=lambda: {"ja": "faster_whisper"})
     device: str = "cuda"
     compute_type: str = "float16"
     beam_final: int = 5
@@ -135,6 +134,9 @@ class MtConfig(BaseModel):
     temperature: float = 0.1
     max_tokens: int = 200
     glossary: str | None = "config/glossary.yaml"  # + glossary.local.yaml (gitignore)
+    # 추론(thinking) 모델의 사고 출력 끄기. 2026-10-25 벤치: qwen3:14b·gemma4 는 켜진 채로는 사고에 토큰을 다 써 40문장 중
+    # 35~39개가 빈 출력(7 s), 끄면 0.3 s 에 정상 출력. 비추론 모델(gemma2 등)에는 영향 없음
+    think: bool = False
 
 
 class LoggingConfig(BaseModel):

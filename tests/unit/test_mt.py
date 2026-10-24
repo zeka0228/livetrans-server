@@ -67,6 +67,7 @@ async def test_ollama_translate_posts_chat_with_json_format():
     assert body["model"] == "qwen2.5:7b" and body["format"] == "json" and body["stream"] is False
     assert body["messages"][-1] == {"role": "user", "content": "今日はいい天気"}
     assert body["options"]["temperature"] == 0.1
+    assert body["think"] is False  # 추론 모델 사고 출력 끔 (벤치 2026-10-25)
 
 
 async def test_ollama_retries_once_on_bad_json_then_raises():

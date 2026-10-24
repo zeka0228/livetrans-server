@@ -22,7 +22,7 @@ stt:
   fallback_model: "large-v3"
   rescue: faster_whisper      # 환각(반복 루프) 판정 시 그 발화만 다시 인식할 구조 엔진. DiCoW 마스크 디코딩이 반복에 자주 빠져서(ERR-008). VRAM +3 GB. 끄려면 null
   rescue_model: large-v3
-  route_by_lang: {ko: faster_whisper, ja: faster_whisper}   # 세션 stt.engine=auto 일 때 언어별 엔진 (떠 있는 엔진만). en 은 기본(dicow)
+  route_by_lang: {ja: faster_whisper}   # 세션 stt.engine=auto 일 때 언어별 엔진 (떠 있는 엔진만). ko·en 은 기본(dicow). 벤치 2026-10-25
   device: "cuda"
   compute_type: "float16"
   beam_final: 5
@@ -62,6 +62,7 @@ mt:                           # 번역 (명세 §4.4). 자막은 번역이 실�
   fallback: [passthrough]
   context_pairs: 3            # 화자별 직전 (원문, 번역) 쌍
   timeout_s: 6.0
+  think: false                # 추론 모델(qwen3·gemma4)의 사고 출력 끔 — 켜 두면 토큰을 다 써 빈 출력 (벤치 2026-10-25)
   glossary: config/glossary.yaml   # 용어집 (+ glossary.local.yaml). 형식: {"ja->ko": {용어: 번역}, "*->ko": {...}}
 
 timeline:                     # 모드 A 시간 모델 (명세 §3)

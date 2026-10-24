@@ -216,6 +216,7 @@ class OllamaTranslator:
             "stream": False,
             "format": "json",
             "keep_alive": self.cfg.keep_alive,
+            "think": self.cfg.think,  # 추론 모델의 사고 출력 (MtConfig.think). 비추론 모델은 무시한다
             "options": {"temperature": self.cfg.temperature, "num_predict": self.cfg.max_tokens},
         }
         try:
