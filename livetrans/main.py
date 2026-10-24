@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 import numpy as np
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from livetrans.api.capture import router as capture_router
 from livetrans.api.hls import router as hls_router
@@ -178,6 +179,15 @@ def create_app(
             await tts.close()
 
     app = FastAPI(title="livetrans", version="0.1.0", lifespan=lifespan)
+    if settings.server.cors_origins:
+        # 브라우저 앱(Flutter 웹) 용. WebSocket 은 CORS 대상이 아니다. (API 계약 Q-API-13)
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.server.cors_origins,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["x-voice-ref", "x-duration-ms", "x-cache"],
+        )
     app.include_router(rest_router)
     app.include_router(sessions_router)
     app.include_router(capture_router)
