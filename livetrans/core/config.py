@@ -138,6 +138,12 @@ class MtConfig(BaseModel):
     # 모드 B·C(실시간 자막)는 적용 안 함. 0 이면 끔
     lookahead_s: float = 3.0
     lookahead_lines: int = 2
+    # 2차 패스: 첫 번역 때 뒤 문맥이 없었던 발화는 다음 발화가 확정되면 한 번 더 번역해(원문 교정 포함) 달라진 것만
+    # translation.update / segment.update 로 보낸다 (모드 A 는 합성 전 큐·TTS 교체). revise_window_s 지난 발화는 안 건드림.
+    # 원문 교정은 편집 비율(문자 편집 거리/길이)이 revise_max_edit 이하일 때만 받는다 (통째 바꿔 쓰기 방지)
+    revise: bool = True
+    revise_window_s: float = 10.0
+    revise_max_edit: float = 0.5
 
 
 class LoggingConfig(BaseModel):

@@ -9,7 +9,12 @@ import pytest
 from livetrans.core.config import MtConfig
 from livetrans.plugins.mt import FallbackTranslator, create_translator, load_glossary
 from livetrans.plugins.mt.base import TranslationError
-from livetrans.plugins.mt.ollama_llm import OllamaTranslator, build_messages, parse_translation
+from livetrans.plugins.mt.ollama_llm import (
+    OllamaTranslator,
+    build_messages,
+    parse_result,
+    parse_translation,
+)
 from livetrans.plugins.mt.passthrough import PassthroughTranslator
 
 
@@ -68,6 +73,56 @@ def test_build_messages_adds_upcoming_lines_for_disambiguation_only():
     assert (
         "spoken right after"
         not in build_messages("hi", src="en", tgt="ko", context=[], glossary={})[0]["content"]
+    )
+
+
+def test_build_messages_second_pass_asks_for_corrected_source():
+    msgs = build_messages("불레", src="ko", tgt="ja", context=[], glossary={}, want_source=True)
+    system = msgs[0]["content"]
+    assert "second pass" in system and '"source": "<corrected original>"' in system
+    assert (
+        '"source"'
+        not in build_messages("불레", src="ko", tgt="ja", context=[], glossary={})[0]["content"]
+    )
+
+
+def test_parse_result_returns_translation_and_optional_source():
+    assert parse_result('{"translation": "見る？", "source": "볼래?"}') == ("見る？", "볼래?")
+    assert parse_result('{"translation": "見る？"}') == ("見る？", None)
+    assert parse_result('{"translation": "見る？", "source": "  "}') == ("見る？", None)
+    assert parse_result('{"source": "볼래?"}') == (None, None)
+    assert parse_result("garbage") == (None, None)
+
+
+async def test_ollama_revise_returns_translation_and_source():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen2.5:7b"}]})
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "message": {"content": '{"translation": "一緒に見る？", "source": "같이 볼래?"}'}
+            },
+        )
+
+    mt = _ollama(handler)
+    out = await mt.revise(
+        "같이 불레",
+        src="ko",
+        tgt="ja",
+        context=[],
+        glossary={},
+        dialogue=[("S0", "영화 어때", "映画どう")],
+        speaker="S1",
+        upcoming=[("S0", "액션으로")],
+    )
+    assert out == ("一緒に見る？", "같이 볼래?")
+    system = seen["body"]["messages"][0]["content"]
+    assert (
+        "second pass" in system and "Recent dialogue" in system and "spoken right after" in system
     )
 
 

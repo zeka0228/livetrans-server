@@ -59,6 +59,13 @@ def load_glossary(path: str | Path | None, src: str, tgt: str) -> dict[str, str]
     return merged
 
 
+def _translate_params_of(fn) -> frozenset[str]:
+    try:
+        return frozenset(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        return frozenset()
+
+
 def _translate_params(engine) -> frozenset[str]:
     """엔진 translate 의 키워드 인자 이름 (1회 검사·캐시). passthrough·테스트 가짜는 문맥 인자를 안 받을 수 있다."""
     cached = getattr(engine, "_translate_params", None)
@@ -193,6 +200,16 @@ class FallbackTranslator:
                 last = err
                 log.warning("번역 실패 %s seg=%s → 다음 엔진: %s", e.name, seg_id, err)
         raise TranslationError(f"모든 번역 엔진 실패: {last}")
+
+    async def revise(self, text: str, **kw) -> tuple[str, str | None] | None:
+        """2차 패스를 지원하는 첫 활성 엔진(Ollama)으로. 지원 엔진이 없으면 None (2차 패스 생략)."""
+        for e in self.active:
+            fn = getattr(e, "revise", None)
+            if fn is None:
+                continue
+            params = _translate_params_of(fn)
+            return await fn(text, **{k: v for k, v in kw.items() if k in params})
+        return None
 
     async def close(self) -> None:
         for e in self._engines:
