@@ -44,7 +44,7 @@ from livetrans.pipeline.lanes import LanePartial, LaneSegmenter, LaneUtterance
 from livetrans.pipeline.segmenter import PartialRequest, Segmenter, SpeechSegment
 from livetrans.pipeline.timeline import Composer, DeadlineEvent, OutputRing, Timeline
 from livetrans.plugins.diar.base import Diarizer
-from livetrans.plugins.mt import FallbackTranslator, load_glossary
+from livetrans.plugins.mt import FallbackTranslator, accepts_dialogue, load_glossary
 from livetrans.plugins.mt.base import Translation, TranslationError, Translator
 from livetrans.plugins.source.base import Source
 from livetrans.plugins.source.loopback import CaptureError
@@ -146,6 +146,11 @@ class Session:
             asyncio.Queue()
         )
         self._mt_context: dict[str | None, deque[tuple[str, str]]] = {}
+        # 최근 대화 (모든 화자: 화자, 원문, 번역) — 번역 프롬프트의 대화 문맥 (mt.dialogue_lines, 0 = 끔)
+        self._dialogue: deque[tuple[str | None, str, str]] = deque(
+            maxlen=max(1, settings.mt.dialogue_lines)
+        )
+        self._dialogue_on = settings.mt.dialogue_lines > 0
         self._glossary_cache: dict[str, dict[str, str]] = {}
         self._max_speakers_per_seg = settings.diar.max_speakers_per_seg
         # 캡처·스트림 소스는 control start 때 켠다 (그 전 소리는 받지 않음). 마이크는 앱이 보내는 대로 받는다.
@@ -833,6 +838,7 @@ class Session:
             context = list(self._mt_context.get(speaker, ()))
             glossary = self._glossary(src)
             try:
+                dialogue = list(self._dialogue) if self._dialogue_on else None
                 if isinstance(self.translator, FallbackTranslator):
                     tr = await self.translator.translate_full(
                         seg_id,
@@ -842,11 +848,22 @@ class Session:
                         context=context,
                         glossary=glossary,
                         speaker=speaker,
+                        dialogue=dialogue,
                     )
                 else:
                     t0 = asyncio.get_running_loop().time()
+                    extra = (
+                        {"dialogue": dialogue, "speaker": speaker}
+                        if accepts_dialogue(self.translator)
+                        else {}
+                    )
                     out = await self.translator.translate(
-                        text, src=src, tgt=self.tgt_lang, context=context, glossary=glossary
+                        text,
+                        src=src,
+                        tgt=self.tgt_lang,
+                        context=context,
+                        glossary=glossary,
+                        **extra,
                     )
                     tr = Translation(
                         seg_id,
@@ -867,6 +884,9 @@ class Session:
             if tr.text and tr.engine != "passthrough":
                 ctx = self._mt_context.setdefault(speaker, deque(maxlen=self._mt_cfg.context_pairs))
                 ctx.append((text, tr.text))
+        if tr.text and self._dialogue_on:
+            # 같은 언어(원문 통과)도 대화 문맥에는 넣는다
+            self._dialogue.append((speaker, text, tr.text))
         payload = {
             "seg_id": tr.seg_id,
             "text": tr.text,

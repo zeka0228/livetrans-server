@@ -130,6 +130,9 @@ class MtConfig(BaseModel):
     temperature: float = 0.1
     max_tokens: int = 200
     glossary: str | None = "config/glossary.yaml"  # + glossary.local.yaml (gitignore)
+    # 번역 프롬프트에 넣는 최근 대화 줄 수 (모든 화자, 원문 → 번역). 0 = 끔. 같은 화자 쌍(context_pairs)과 별개.
+    # 2026-10-25: 상대 화자 발화가 있어야 지시어·생략 주어·존댓말과 STT 오류(동음어)를 고칠 재료가 생긴다
+    dialogue_lines: int = 8
 
 
 class LoggingConfig(BaseModel):

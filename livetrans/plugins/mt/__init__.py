@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from pathlib import Path
@@ -58,6 +59,21 @@ def load_glossary(path: str | Path | None, src: str, tgt: str) -> dict[str, str]
     return merged
 
 
+def accepts_dialogue(engine) -> bool:
+    """엔진의 translate 가 `dialogue` 인자를 받는지 (Ollama 는 받고, passthrough·테스트 가짜는 안 받을 수 있다)."""
+    cached = getattr(engine, "_accepts_dialogue", None)
+    if cached is None:
+        try:
+            cached = "dialogue" in inspect.signature(engine.translate).parameters
+        except (TypeError, ValueError):
+            cached = False
+        try:
+            engine._accepts_dialogue = cached
+        except AttributeError:
+            pass
+    return cached
+
+
 class FallbackTranslator:
     """엔진 체인: 앞 엔진이 로드에 실패하면 빼고, 번역에 실패하면 다음 엔진으로. `fallback` 플래그를 Translation 에 남긴다."""
 
@@ -99,6 +115,8 @@ class FallbackTranslator:
         context: list[ContextPair],
         glossary: dict[str, str],
         length_budget_s: float | None = None,
+        dialogue: list | None = None,
+        speaker: str | None = None,
     ) -> str:
         return (
             await self.translate_full(
@@ -109,6 +127,8 @@ class FallbackTranslator:
                 context=context,
                 glossary=glossary,
                 length_budget_s=length_budget_s,
+                speaker=speaker,
+                dialogue=dialogue,
             )
         ).text
 
@@ -123,11 +143,13 @@ class FallbackTranslator:
         glossary: dict[str, str],
         length_budget_s: float | None = None,
         speaker: str | None = None,
+        dialogue: list | None = None,
     ) -> Translation:
         t0 = time.perf_counter()
         last: Exception | None = None
         for i, e in enumerate(self.active):
             try:
+                extra = {"dialogue": dialogue, "speaker": speaker} if accepts_dialogue(e) else {}
                 out = await e.translate(
                     text,
                     src=src,
@@ -135,6 +157,7 @@ class FallbackTranslator:
                     context=context,
                     glossary=glossary,
                     length_budget_s=length_budget_s,
+                    **extra,
                 )
                 return Translation(
                     seg_id=seg_id,

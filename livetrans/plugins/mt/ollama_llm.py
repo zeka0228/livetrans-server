@@ -39,6 +39,14 @@ LANG_NAMES = {
 }
 
 
+DialogueLine = tuple[str | None, str, str]  # (화자, 원문, 번역)
+MAX_DIALOGUE_LINES = 12
+
+
+def _clip(s: str, n: int = 80) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
 def lang_name(code: str) -> str:
     return LANG_NAMES.get(code.split("-")[0].lower(), code)
 
@@ -51,15 +59,28 @@ def build_messages(
     context: list[ContextPair],
     glossary: dict[str, str],
     length_budget_s: float | None = None,
+    dialogue: list[DialogueLine] | None = None,
+    speaker: str | None = None,
 ) -> list[dict[str, str]]:
-    """Ollama chat 메시지. 문맥 쌍은 (user 원문 → assistant JSON) 대화로 넣어 모델이 형식을 따라가게 한다."""
+    """Ollama chat 메시지. 같은 화자의 문맥 쌍은 (user 원문 → assistant JSON) 대화로 넣어 모델이 형식을 따라가게 하고,
+    최근 대화(모든 화자)는 시스템 메시지에 "화자: 원문 -> 번역" 줄로 넣는다 (지시어·생략 주어·STT 오류 교정 재료)."""
     system = (
         f"You are a live-broadcast subtitle translator. Translate the user's {lang_name(src)} utterance "
         f"into natural, concise {lang_name(tgt)} as spoken subtitles for viewers. Keep the speaker's tone. "
         "Keep proper names, game terms and numbers; do not add explanations or omit content. "
-        "The input is automatic speech recognition output without punctuation and may contain small errors; "
-        "infer the intended meaning from context."
+        "The input is automatic speech recognition output without punctuation and may contain recognition errors "
+        "(homophones, dropped particles, split or merged words). First silently correct such errors using the "
+        "dialogue context, then translate the intended meaning. Resolve pronouns, omitted subjects and the level of "
+        "politeness from the dialogue, and keep names and terms consistent with earlier lines."
     )
+    if dialogue:
+        tag = f" The current speaker is {speaker}." if speaker else ""
+        shown = "\n".join(
+            f"{'> ' if speaker and who == speaker else ''}{who or 'speaker'}: {_clip(s)} -> {_clip(t)}"
+            for who, s, t in dialogue[-MAX_DIALOGUE_LINES:]
+        )
+        system += " Recent dialogue, oldest first (speaker: original -> translation):\n"
+        system += f"{shown}\n{tag}"
     if glossary:
         pairs = "; ".join(f"{k} -> {v}" for k, v in list(glossary.items())[:60])
         system += f" Use these fixed translations when the term appears: {pairs}."
@@ -166,6 +187,8 @@ class OllamaTranslator:
         context: list[ContextPair],
         glossary: dict[str, str],
         length_budget_s: float | None = None,
+        dialogue: list[DialogueLine] | None = None,
+        speaker: str | None = None,
     ) -> str:
         messages = build_messages(
             text,
@@ -174,6 +197,8 @@ class OllamaTranslator:
             context=context,
             glossary=glossary,
             length_budget_s=length_budget_s,
+            dialogue=dialogue,
+            speaker=speaker,
         )
         for attempt in range(2):
             content = await self._chat(messages)

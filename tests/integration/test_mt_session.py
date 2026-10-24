@@ -166,3 +166,53 @@ def test_utterance_mode_translation_without_speaker():
     _, events = run(mt, stream=False)
     trs = [e["payload"] for e in events if e["type"] == "translation.final"]
     assert trs and all("speaker" not in t for t in trs)
+
+
+class DialogueFakeTranslator(FakeTranslator):
+    """`dialogue`·`speaker` 를 받는 엔진 (Ollama 처럼). 세션이 최근 대화를 넘기는지 본다."""
+
+    async def translate(
+        self,
+        text,
+        *,
+        src,
+        tgt,
+        context,
+        glossary,
+        length_budget_s=None,
+        dialogue=None,
+        speaker=None,
+    ):
+        out = await super().translate(
+            text,
+            src=src,
+            tgt=tgt,
+            context=context,
+            glossary=glossary,
+            length_budget_s=length_budget_s,
+        )
+        self.calls[-1]["dialogue"] = list(dialogue or [])
+        self.calls[-1]["speaker"] = speaker
+        return out
+
+
+def test_session_passes_recent_dialogue_of_all_speakers_to_engine():
+    mt = DialogueFakeTranslator()
+    _, events = run(mt)
+    finals = [e["payload"] for e in events if e["type"] == "segment.final"]
+    assert len(mt.calls) >= 3
+    # S1 의 첫 발화(seg 1) 번역 때: 같은 화자 문맥은 비어 있지만 대화 문맥에는 S0 의 seg 0 이 있다
+    second = mt.calls[1]
+    assert second["context"] == [] and second["speaker"] == finals[1]["speaker"]
+    assert second["dialogue"] == [
+        (finals[0]["speaker"], finals[0]["text"], f"[ja->ko] {finals[0]['text']}")
+    ]
+    # 세 번째 호출은 앞의 두 줄을 순서대로 본다
+    assert [d[1] for d in mt.calls[2]["dialogue"]] == [finals[0]["text"], finals[1]["text"]]
+
+
+def test_engine_without_dialogue_parameter_still_works():
+    mt = FakeTranslator()  # translate 에 dialogue 인자가 없다 → 세션이 넘기지 않는다
+    _, events = run(mt)
+    assert [e for e in events if e["type"] == "translation.final"]
+    assert all("dialogue" not in c for c in mt.calls)

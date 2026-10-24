@@ -60,6 +60,7 @@ mt:                           # 번역 (명세 §4.4). 자막은 번역이 실�
   model: gemma2:9b            # 2026-10-23 측정: 190~440 ms/문장, 서버와 함께 100 % GPU (6.3 GB). qwen2.5:7b 는 빠르지만 한국어 출력에 중국어가 섞임
   fallback: [passthrough]
   context_pairs: 3            # 화자별 직전 (원문, 번역) 쌍
+  dialogue_lines: 8           # 프롬프트에 넣는 최근 대화(모든 화자) 줄 수. 상대 발화로 지시어·생략 주어·STT 오류를 고친다 (2026-10-25)
   timeout_s: 6.0
   glossary: config/glossary.yaml   # 용어집 (+ glossary.local.yaml). 형식: {"ja->ko": {용어: 번역}, "*->ko": {...}}
 

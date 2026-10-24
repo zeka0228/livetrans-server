@@ -30,6 +30,27 @@ def test_build_messages_has_system_context_and_glossary():
     assert msgs[-1]["content"] == "今日はいい天気ですね"
 
 
+def test_build_messages_puts_dialogue_and_correction_instruction_in_system():
+    msgs = build_messages(
+        "불레",
+        src="ko",
+        tgt="ja",
+        context=[],
+        glossary={},
+        dialogue=[("S0", "같이 영화 볼래?", "一緒に映画見る？"), ("S1", "응 좋아", "うん、いいよ")],
+        speaker="S1",
+    )
+    system = msgs[0]["content"]
+    assert "Recent dialogue" in system and "S0: 같이 영화 볼래? -> 一緒に映画見る？" in system
+    assert "> S1: 응 좋아 -> うん、いいよ" in system  # 현재 화자 표시
+    assert "The current speaker is S1" in system
+    assert "correct such errors" in system and "omitted subjects" in system
+    assert [m["role"] for m in msgs[1:]] == ["user"] and msgs[-1]["content"] == "불레"
+    # dialogue 가 없으면 대화 블록도 없다
+    plain = build_messages("hi", src="en", tgt="ko", context=[], glossary={})
+    assert "Recent dialogue" not in plain[0]["content"]
+
+
 def test_parse_translation_accepts_json_and_rejects_garbage():
     assert parse_translation('{"translation": "안녕"}') == "안녕"
     assert parse_translation('Sure! {"translation": "안녕"} ok') == "안녕"
