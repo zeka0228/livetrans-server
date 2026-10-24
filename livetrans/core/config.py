@@ -125,7 +125,9 @@ class MtConfig(BaseModel):
     """번역 (명세 §4.4). 기본 Ollama 로컬 LLM, 실패하면 체인 → 마지막은 항상 원문(passthrough)."""
 
     engine: str = "passthrough"  # ollama_llm | passthrough. 모델 기본값은 passthrough(테스트가 네트워크를 안 타게), 저장소 default.yaml 이 ollama_llm 으로 켠다
-    model: str = "gemma2:9b"  # 2026-10-23 측정: 190~440 ms/문장(서버와 함께 100 % GPU, 6.3 GB), 한국어 자연스러움. qwen2.5:7b 는 한국어 출력 중 중국어로 샘
+    # 2026-10-25 벤치(40문장 chrF, 서버와 동시 100 % GPU): gemma4:e4b ja 56 / en 43, 0.2 s, VRAM 3.3 GB > gemma3:12b-it-qat 41/34, 1.0 s,
+    # 8.8 GB > gemma2:9b 39/24, 0.3 s, 6.3 GB. qwen2.5:7b 는 한국어 출력에 중국어가 샘. 추론 모델은 think=false 필수
+    model: str = "gemma4:e4b"
     url: str = "http://127.0.0.1:11434"
     fallback: list[str] = Field(default_factory=lambda: ["passthrough"])
     context_pairs: int = 3  # 화자별 직전 (원문, 번역) 쌍 수
