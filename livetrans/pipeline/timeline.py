@@ -204,6 +204,29 @@ class Composer:
         self._tts.append(TtsClip(seg_id, t_start_ms, pcm, speaker, placed_at_ms=placed))
         return ev
 
+    def replace_cue(self, seg_id: int, kind: str, speaker: str | None, text: str) -> bool:
+        """아직 한 번도 합성에 실리지 않은 큐의 문구를 바꾼다 (2차 패스). 이미 나간 큐면 False."""
+        composed_until_ms = self.tl.segment_bounds_ms(self.next_k)[0]
+        done = False
+        for c in self._cues:
+            if c.seg_id == seg_id and c.kind == kind and c.speaker == speaker:
+                if (c.shown_from_ms or c.t_start_ms) < composed_until_ms:
+                    return False
+                c.text = text
+                done = True
+        return done
+
+    def replace_tts(self, seg_id: int, speaker: str | None, pcm: np.ndarray) -> bool:
+        """아직 합성 전인 TTS 클립의 소리를 바꾼다 (2차 패스로 번역이 달라졌을 때). 이미 나갔으면 False."""
+        composed_until_ms = self.tl.segment_bounds_ms(self.next_k)[0]
+        for c in self._tts:
+            if c.seg_id == seg_id and c.speaker == speaker:
+                if c.placed_at_ms is None or c.placed_at_ms < composed_until_ms:
+                    return False
+                c.pcm = pcm
+                return True
+        return False
+
     # --- 합성 ---
 
     def compose(self, k: int | None = None) -> SegmentOut:

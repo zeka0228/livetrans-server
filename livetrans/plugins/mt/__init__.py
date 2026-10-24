@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from pathlib import Path
@@ -58,6 +59,45 @@ def load_glossary(path: str | Path | None, src: str, tgt: str) -> dict[str, str]
     return merged
 
 
+def _translate_params_of(fn) -> frozenset[str]:
+    try:
+        return frozenset(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        return frozenset()
+
+
+def _translate_params(engine) -> frozenset[str]:
+    """엔진 translate 의 키워드 인자 이름 (1회 검사·캐시). passthrough·테스트 가짜는 문맥 인자를 안 받을 수 있다."""
+    cached = getattr(engine, "_translate_params", None)
+    if cached is None:
+        try:
+            cached = frozenset(inspect.signature(engine.translate).parameters)
+        except (TypeError, ValueError):
+            cached = frozenset()
+        try:
+            engine._translate_params = cached
+        except AttributeError:
+            pass
+    return cached
+
+
+def accepts_dialogue(engine) -> bool:
+    return "dialogue" in _translate_params(engine)
+
+
+def context_kwargs(engine, *, dialogue, speaker, upcoming) -> dict:
+    """엔진이 받는 문맥 인자만 골라 넘긴다 (dialogue·speaker·upcoming)."""
+    params = _translate_params(engine)
+    out: dict = {}
+    if "dialogue" in params:
+        out["dialogue"] = dialogue
+        if "speaker" in params:
+            out["speaker"] = speaker
+    if "upcoming" in params:
+        out["upcoming"] = upcoming
+    return out
+
+
 class FallbackTranslator:
     """엔진 체인: 앞 엔진이 로드에 실패하면 빼고, 번역에 실패하면 다음 엔진으로. `fallback` 플래그를 Translation 에 남긴다."""
 
@@ -90,6 +130,14 @@ class FallbackTranslator:
     async def health(self) -> bool:
         return bool(self.active) and await self.active[0].health()
 
+    async def list_models(self) -> list[dict]:
+        """체인에서 모델 목록을 줄 수 있는 첫 엔진(Ollama)의 설치 모델."""
+        for e in self.active:
+            fn = getattr(e, "list_models", None)
+            if fn is not None:
+                return await fn()
+        return []
+
     async def translate(
         self,
         text: str,
@@ -99,6 +147,9 @@ class FallbackTranslator:
         context: list[ContextPair],
         glossary: dict[str, str],
         length_budget_s: float | None = None,
+        dialogue: list | None = None,
+        speaker: str | None = None,
+        upcoming: list | None = None,
     ) -> str:
         return (
             await self.translate_full(
@@ -109,6 +160,9 @@ class FallbackTranslator:
                 context=context,
                 glossary=glossary,
                 length_budget_s=length_budget_s,
+                speaker=speaker,
+                dialogue=dialogue,
+                upcoming=upcoming,
             )
         ).text
 
@@ -123,11 +177,14 @@ class FallbackTranslator:
         glossary: dict[str, str],
         length_budget_s: float | None = None,
         speaker: str | None = None,
+        dialogue: list | None = None,
+        upcoming: list | None = None,
     ) -> Translation:
         t0 = time.perf_counter()
         last: Exception | None = None
         for i, e in enumerate(self.active):
             try:
+                extra = context_kwargs(e, dialogue=dialogue, speaker=speaker, upcoming=upcoming)
                 out = await e.translate(
                     text,
                     src=src,
@@ -135,6 +192,7 @@ class FallbackTranslator:
                     context=context,
                     glossary=glossary,
                     length_budget_s=length_budget_s,
+                    **extra,
                 )
                 return Translation(
                     seg_id=seg_id,
@@ -150,6 +208,16 @@ class FallbackTranslator:
                 last = err
                 log.warning("번역 실패 %s seg=%s → 다음 엔진: %s", e.name, seg_id, err)
         raise TranslationError(f"모든 번역 엔진 실패: {last}")
+
+    async def revise(self, text: str, **kw) -> tuple[str, str | None] | None:
+        """2차 패스를 지원하는 첫 활성 엔진(Ollama)으로. 지원 엔진이 없으면 None (2차 패스 생략)."""
+        for e in self.active:
+            fn = getattr(e, "revise", None)
+            if fn is None:
+                continue
+            params = _translate_params_of(fn)
+            return await fn(text, **{k: v for k, v in kw.items() if k in params})
+        return None
 
     async def close(self) -> None:
         for e in self._engines:

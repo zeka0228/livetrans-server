@@ -9,7 +9,12 @@ import pytest
 from livetrans.core.config import MtConfig
 from livetrans.plugins.mt import FallbackTranslator, create_translator, load_glossary
 from livetrans.plugins.mt.base import TranslationError
-from livetrans.plugins.mt.ollama_llm import OllamaTranslator, build_messages, parse_translation
+from livetrans.plugins.mt.ollama_llm import (
+    OllamaTranslator,
+    build_messages,
+    parse_result,
+    parse_translation,
+)
 from livetrans.plugins.mt.passthrough import PassthroughTranslator
 
 
@@ -28,6 +33,97 @@ def test_build_messages_has_system_context_and_glossary():
     assert [m["role"] for m in msgs[1:]] == ["user", "assistant", "user"]
     assert json.loads(msgs[2]["content"]) == {"translation": "안녕하세요"}
     assert msgs[-1]["content"] == "今日はいい天気ですね"
+
+
+def test_build_messages_puts_dialogue_and_correction_instruction_in_system():
+    msgs = build_messages(
+        "불레",
+        src="ko",
+        tgt="ja",
+        context=[],
+        glossary={},
+        dialogue=[("S0", "같이 영화 볼래?", "一緒に映画見る？"), ("S1", "응 좋아", "うん、いいよ")],
+        speaker="S1",
+    )
+    system = msgs[0]["content"]
+    assert "Recent dialogue" in system and "S0: 같이 영화 볼래? -> 一緒に映画見る？" in system
+    assert "> S1: 응 좋아 -> うん、いいよ" in system  # 현재 화자 표시
+    assert "The current speaker is S1" in system
+    assert "correct such errors" in system and "omitted subjects" in system
+    assert [m["role"] for m in msgs[1:]] == ["user"] and msgs[-1]["content"] == "불레"
+    # dialogue 가 없으면 대화 블록도 없다
+    plain = build_messages("hi", src="en", tgt="ko", context=[], glossary={})
+    assert "Recent dialogue" not in plain[0]["content"]
+
+
+def test_build_messages_adds_upcoming_lines_for_disambiguation_only():
+    msgs = build_messages(
+        "그 키 어디 있어",
+        src="ko",
+        tgt="en",
+        context=[],
+        glossary={},
+        upcoming=[("S1", "파란 열쇠 말이야?"), ("S0", "응 상자 열 때 쓰는 거")],
+    )
+    system = msgs[0]["content"]
+    assert "spoken right after the current utterance" in system
+    assert "S1: 파란 열쇠 말이야?" in system and "S0: 응 상자 열 때 쓰는 거" in system
+    assert "never translate or merge" in system
+    assert msgs[-1]["content"] == "그 키 어디 있어"
+    assert (
+        "spoken right after"
+        not in build_messages("hi", src="en", tgt="ko", context=[], glossary={})[0]["content"]
+    )
+
+
+def test_build_messages_second_pass_asks_for_corrected_source():
+    msgs = build_messages("불레", src="ko", tgt="ja", context=[], glossary={}, want_source=True)
+    system = msgs[0]["content"]
+    assert "second pass" in system and '"source": "<corrected original>"' in system
+    assert (
+        '"source"'
+        not in build_messages("불레", src="ko", tgt="ja", context=[], glossary={})[0]["content"]
+    )
+
+
+def test_parse_result_returns_translation_and_optional_source():
+    assert parse_result('{"translation": "見る？", "source": "볼래?"}') == ("見る？", "볼래?")
+    assert parse_result('{"translation": "見る？"}') == ("見る？", None)
+    assert parse_result('{"translation": "見る？", "source": "  "}') == ("見る？", None)
+    assert parse_result('{"source": "볼래?"}') == (None, None)
+    assert parse_result("garbage") == (None, None)
+
+
+async def test_ollama_revise_returns_translation_and_source():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": [{"name": "qwen2.5:7b"}]})
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "message": {"content": '{"translation": "一緒に見る？", "source": "같이 볼래?"}'}
+            },
+        )
+
+    mt = _ollama(handler)
+    out = await mt.revise(
+        "같이 불레",
+        src="ko",
+        tgt="ja",
+        context=[],
+        glossary={},
+        dialogue=[("S0", "영화 어때", "映画どう")],
+        speaker="S1",
+        upcoming=[("S0", "액션으로")],
+    )
+    assert out == ("一緒に見る？", "같이 볼래?")
+    system = seen["body"]["messages"][0]["content"]
+    assert (
+        "second pass" in system and "Recent dialogue" in system and "spoken right after" in system
+    )
 
 
 def test_parse_translation_accepts_json_and_rejects_garbage():
@@ -67,6 +163,7 @@ async def test_ollama_translate_posts_chat_with_json_format():
     assert body["model"] == "qwen2.5:7b" and body["format"] == "json" and body["stream"] is False
     assert body["messages"][-1] == {"role": "user", "content": "今日はいい天気"}
     assert body["options"]["temperature"] == 0.1
+    assert body["think"] is False  # 추론 모델 사고 출력 끔 (벤치 2026-10-25)
     assert body["options"]["use_mmap"] is True  # Ollama 러너 mmap 로딩 (RAM −7 GB, 2026-10-25)
 
 
