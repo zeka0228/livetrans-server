@@ -22,6 +22,7 @@ stt:
   fallback_model: "large-v3"
   rescue: faster_whisper      # 환각(반복 루프) 판정 시 그 발화만 다시 인식할 구조 엔진. DiCoW 마스크 디코딩이 반복에 자주 빠져서(ERR-008). VRAM +3 GB. 끄려면 null
   rescue_model: large-v3
+  route_by_lang: {ko: faster_whisper, ja: faster_whisper}   # 세션 stt.engine=auto 일 때 언어별 엔진 (떠 있는 엔진만). en 은 기본(dicow)
   device: "cuda"
   compute_type: "float16"
   beam_final: 5

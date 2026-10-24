@@ -157,6 +157,20 @@ class OllamaTranslator:
         except httpx.HTTPError:
             return False
 
+    async def list_models(self) -> list[dict]:
+        """Ollama 에 설치된 모델 (세션 요청 `mt.model` 후보, API 계약 S-26). 못 받으면 빈 목록."""
+        try:
+            r = await self._client.get("/api/tags", timeout=3.0)
+            r.raise_for_status()
+        except httpx.HTTPError:
+            return []
+        out = []
+        for m in r.json().get("models", []):
+            name = m.get("name") or ""
+            if name and "embed" not in name:  # 임베딩 모델은 번역에 못 쓴다
+                out.append({"name": name, "size_mb": int(int(m.get("size", 0)) // (1024 * 1024))})
+        return out
+
     async def translate(
         self,
         text: str,

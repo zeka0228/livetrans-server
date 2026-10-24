@@ -124,6 +124,7 @@ class Session:
         tts_enabled: bool = False,
         tts_voice_ref: str | None = None,
         show_speaker: bool = True,
+        stt_engine: str = "auto",
     ) -> None:
         self.session_id = session_id or uuid.uuid4().hex[:12]
         self.mode = mode
@@ -133,6 +134,13 @@ class Session:
         self.source = source
         self.diarizer = diarizer
         self.rescue_stt = rescue_stt  # 환각 판정 시 그 발화만 다시 인식 (없으면 살리기만)
+        # STT 엔진 선택 (API 계약 S-26): 세션 요청 stt.engine ("auto" | 이름). auto 면 settings.stt.route_by_lang 으로
+        # 언어별 라우팅 (예: ko·ja → faster_whisper). 후보는 기본 엔진과 구조 엔진 (둘 다 이미 떠 있어 VRAM 추가 없음)
+        self._stt_choice = stt_engine or "auto"
+        self._route: dict[str, str] = dict(settings.stt.route_by_lang)
+        self._engines: dict[str, STTEngine] = {
+            e.name: e for e in (rescue_stt, stt) if e is not None
+        }  # 같은 이름이면 기본 엔진 우선
         # D-028 스트림 모드: 연속 오디오 화자 분할 + 화자 레인. 있으면 VAD 세그먼터 대신 레인이 발화를 자른다
         self.stream = stream_diarizer
         self._vad_cfg = settings.vad
@@ -908,9 +916,10 @@ class Session:
             )
         if len(seg.pcm) < 1600:  # 0.1 s 미만은 돌리지 않는다
             return
-        mask = speaker if getattr(self.stt, "supports_speaker_mask", False) else None
+        engine = self._engine_for(speaker)
+        mask = speaker if getattr(engine, "supports_speaker_mask", False) else None
         try:
-            tr = await self.stt.transcribe(
+            tr = await engine.transcribe(
                 seg,
                 lang=self._lang_hint(speaker),
                 prompt=self._prev_text.get(speaker) or None,
@@ -940,19 +949,19 @@ class Session:
         else:
             diar_ms = await self._attach_speakers(seg)
         self._dump_segment(seg)
+        engine = self._engine_for(seg.speakers[0] if seg.speakers else None)
+        mask_ok = getattr(engine, "supports_speaker_mask", False)
         if self.stream is not None:
             # 레인 발화: 이 레인의 화자 1명만 인식 (다른 화자는 마스크로만 쓴다)
-            targets: list[str | None] = [
-                seg.speakers[0] if getattr(self.stt, "supports_speaker_mask", False) else None
-            ]
-        elif seg.speakers and getattr(self.stt, "supports_speaker_mask", False):
+            targets: list[str | None] = [seg.speakers[0] if mask_ok else None]
+        elif seg.speakers and mask_ok:
             # 화자 마스크를 지원하는 엔진이면 화자마다 1회, 아니면 구간 전체 1회 (주 화자만 표시)
             targets = list(seg.speakers)
         else:
             targets = [None]
         results: list[tuple[str | None, Transcript, int]] = []
         for speaker in targets:
-            got = await self._transcribe_final(seg, speaker)
+            got = await self._transcribe_final(seg, speaker, engine)
             if got is not None:
                 results.append((speaker, *got))
         self._final_done.add(seg.seg_id)
@@ -993,24 +1002,33 @@ class Session:
         return diar_ms
 
     async def _transcribe_final(
-        self, seg: SpeechSegment, speaker: str | None
+        self, seg: SpeechSegment, speaker: str | None, engine: STTEngine | None = None
     ) -> tuple[Transcript, int] | None:
-        """확정 인식 1회 (+ 저확률 언어 재인식). 실패하면 `E_STT_FAILED` 를 보내고 None."""
+        """확정 인식 1회 (+ 저확률 언어 재인식, 언어 라우팅 재인식). 실패하면 `E_STT_FAILED` 를 보내고 None."""
+        engine = engine or self.stt
         prompt = self._prev_text.get(speaker) or None
         try:
-            tr = await self.stt.transcribe(
+            tr = await engine.transcribe(
                 seg, lang=self.src_lang, prompt=prompt, final=True, speaker=speaker
             )
             stt_ms = tr.latency_ms
             if self.src_lang is None:
                 majority = self._majority_lang(speaker)
                 if tr.lang_prob < LANG_CONFIDENT and majority and majority != tr.lang:
-                    tr = await self.stt.transcribe(
+                    tr = await engine.transcribe(
                         seg, lang=majority, prompt=prompt, final=True, speaker=speaker
                     )
                     stt_ms += tr.latency_ms
                 elif tr.lang_prob >= LANG_CONFIDENT:
                     self._lang_votes.setdefault(speaker, deque(maxlen=LANG_VOTES)).append(tr.lang)
+                    # 감지된 언어가 다른 엔진으로 라우팅되면 이 발화부터 그 엔진으로 다시 인식 (첫 발화도 놓치지 않게)
+                    routed = self._engine_for(speaker, tr.lang)
+                    if routed is not engine:
+                        mask = speaker if getattr(routed, "supports_speaker_mask", False) else None
+                        tr = await routed.transcribe(
+                            seg, lang=tr.lang, prompt=prompt, final=True, speaker=mask
+                        )
+                        stt_ms += tr.latency_ms
             tr, extra_ms = await self._recover_final(seg, tr, speaker, self.src_lang or tr.lang)
             stt_ms += extra_ms
         except Exception as e:
@@ -1046,3 +1064,15 @@ class Session:
 
     def _lang_hint(self, speaker: str | None = None) -> str | None:
         return self.src_lang or self._majority_lang(speaker)
+
+    def _engine_for(self, speaker: str | None, lang: str | None = None) -> STTEngine:
+        """이 발화를 인식할 엔진: 세션 지정(stt.engine) > 언어 라우팅(route_by_lang, auto) > 기본 엔진."""
+        if self._stt_choice != "auto":
+            return self._engines.get(self._stt_choice, self.stt)
+        hint = (lang or self._lang_hint(speaker) or "").split("-")[0].lower()
+        name = self._route.get(hint) if hint else None
+        if name and name != self.stt.name:
+            alt = self._engines.get(name)
+            if alt is not None:
+                return alt
+        return self.stt

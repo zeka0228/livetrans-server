@@ -47,6 +47,11 @@ class SttConfig(BaseModel):
         None  # 환각 판정 시 그 발화만 다시 인식할 구조 엔진 (기본 엔진과 함께 로드, VRAM 추가)
     )
     rescue_model: str = "large-v3"
+    # 언어별 라우팅 (세션 요청 stt.engine 이 "auto" 일 때): 지정/감지 언어 → 엔진 이름. 그 엔진이 기본 또는 구조 엔진으로
+    # 떠 있을 때만 적용된다. 2026-10-25: DiCoW(영어 중심 미세조정)가 빠뜨린 한국어 구절을 faster-whisper 는 잡아서 ko·ja 는 fw 로
+    route_by_lang: dict[str, str] = Field(
+        default_factory=lambda: {"ko": "faster_whisper", "ja": "faster_whisper"}
+    )
     device: str = "cuda"
     compute_type: str = "float16"
     beam_final: int = 5
