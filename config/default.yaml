@@ -28,6 +28,8 @@ stt:
   device: "cuda"
   compute_type: "float16"
   beam_final: 5
+  second_opinion: mode_a     # 확정 인식 뒤 다른 엔진으로 한 번 더 인식해 다르면 번역이 문맥으로 고른다 (S-30). mode_a | always | off
+  word_prob_low: 0.5          # 이 미만 확률의 단어는 '불확실' 로 번역 프롬프트에 표시 (faster-whisper)
   beam_partial: 1
   language: null              # null = 자동 감지, 또는 "ko" | "en" | "ja"
 diar:
@@ -69,6 +71,7 @@ mt:                           # 번역 (명세 §4.4). 자막은 번역이 실�
   revise: true                # 2차 패스: 뒤 문맥 없이 번역된 발화를 다음 발화 확정 뒤 한 번 더 번역·원문 교정 → *.update 이벤트 (S-28)
   revise_window_s: 10.0       # 이보다 오래된 발화는 2차 패스 안 함
   revise_max_edit: 0.5        # 원문 교정 허용 편집 비율 (넘으면 통째 바꿔 쓴 것으로 보고 버림)
+  confidence_low: 0.5         # 모델 확신도가 이 미만이면 translation.final.uncertain = true
   dialogue_lines: 8           # 프롬프트에 넣는 최근 대화(모든 화자) 줄 수. 상대 발화로 지시어·생략 주어·STT 오류를 고친다 (2026-10-25)
   timeout_s: 6.0
   think: false                # 추론 모델(qwen3·gemma4)의 사고 출력 끔 — 켜 두면 토큰을 다 써 빈 출력 (벤치 2026-10-25)

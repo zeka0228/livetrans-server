@@ -44,6 +44,8 @@ DialogueLine = tuple[str | None, str, str]  # (화자, 원문, 번역)
 UpcomingLine = tuple[str | None, str]  # (화자, 원문) — 아직 번역 안 된 뒤 발화
 MAX_DIALOGUE_LINES = 12
 MAX_UPCOMING_LINES = 3
+MAX_HYPOTHESES = 4
+MAX_UNCERTAIN_WORDS = 8
 
 
 def _clip(s: str, n: int = 80) -> str:
@@ -66,6 +68,8 @@ def build_messages(
     speaker: str | None = None,
     upcoming: list[UpcomingLine] | None = None,
     want_source: bool = False,
+    hypotheses: list[str] | None = None,
+    uncertain_words: list[str] | None = None,
 ) -> list[dict[str, str]]:
     """Ollama chat 메시지. 같은 화자의 문맥 쌍은 (user 원문 → assistant JSON) 대화로 넣어 모델이 형식을 따라가게 하고,
     최근 대화(모든 화자)는 시스템 메시지에 "화자: 원문 -> 번역" 줄로 넣는다 (지시어·생략 주어·STT 오류 교정 재료)."""
@@ -100,12 +104,29 @@ def build_messages(
         system += f" Use these fixed translations when the term appears: {pairs}."
     if length_budget_s:
         system += f" The translation will be spoken aloud in about {length_budget_s:.0f} seconds, so keep it short."
+    rescoring = bool(hypotheses and len(hypotheses) > 1) or bool(uncertain_words)
+    if hypotheses and len(hypotheses) > 1:
+        listed = "\n".join(f"{i}) {_clip(h)}" for i, h in enumerate(hypotheses[:MAX_HYPOTHESES], 1))
+        system += (
+            " The speech recognizer was unsure; alternative transcriptions of the current line, most likely "
+            f"first:\n{listed}\nPick the reading that is most plausible in this conversation (prefer 1 unless "
+            "the context clearly favors another) and translate that reading."
+        )
+    if uncertain_words:
+        system += (
+            " Low-confidence words in the current line: "
+            + ", ".join(f'"{w}"' for w in uncertain_words[:MAX_UNCERTAIN_WORDS])
+            + ". Consider likely misrecognitions of these words given the context."
+        )
+    if want_source or rescoring:
+        want_source = True
     if want_source:
         system += (
             ' This is a second pass with more context. Also return the corrected original line as "source": '
             "the same language and the same content with recognition errors fixed; if nothing needs fixing, "
-            "copy the original unchanged. Respond with JSON only: "
-            '{"translation": "<translated text>", "source": "<corrected original>"}'
+            'copy the original unchanged. Also return "confidence": a number from 0 to 1 for how sure you are '
+            "that the final source is what was actually said (1 = certain). Respond with JSON only: "
+            '{"translation": "<translated text>", "source": "<corrected original>", "confidence": <0-1>}'
         )
     else:
         system += ' Respond with JSON only: {"translation": "<translated text>"}'
@@ -150,30 +171,35 @@ def parse_translation(content: str) -> str | None:
     return parse_result(content)[0]
 
 
-def parse_result(content: str) -> tuple[str | None, str | None]:
-    """모델 출력에서 (번역문, 교정 원문). 번역문이 없으면 (None, None); 교정 원문은 2차 패스에서만 온다."""
+def parse_result(content: str) -> tuple[str | None, str | None, float | None]:
+    """모델 출력에서 (번역문, 교정 원문, 확신도). 번역문이 없으면 (None, None, None); 뒤 둘은 요청했을 때만 온다."""
     content = content.strip()
     if not content:
-        return None, None
+        return None, None, None
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
         # 앞뒤에 군말이 붙은 경우 첫 { … } 만 시도
         a, b = content.find("{"), content.rfind("}")
         if a < 0 or b <= a:
-            return None, None
+            return None, None, None
         try:
             data = json.loads(content[a : b + 1])
         except json.JSONDecodeError:
-            return None, None
+            return None, None, None
     if isinstance(data, dict):
         tr = data.get("translation")
         if not isinstance(tr, str) or not tr.strip():
-            return None, None
+            return None, None, None
         src = data.get("source")
         src = src.strip() if isinstance(src, str) and src.strip() else None
-        return tr.strip(), src
-    return None, None
+        conf = data.get("confidence")
+        try:
+            conf = min(1.0, max(0.0, float(conf))) if conf is not None else None
+        except (TypeError, ValueError):
+            conf = None
+        return tr.strip(), src, conf
+    return None, None, None
 
 
 class OllamaTranslator:
@@ -234,7 +260,42 @@ class OllamaTranslator:
         dialogue: list[DialogueLine] | None = None,
         speaker: str | None = None,
         upcoming: list[UpcomingLine] | None = None,
+        hypotheses: list[str] | None = None,
+        uncertain_words: list[str] | None = None,
     ) -> str:
+        return (
+            await self.translate_ex(
+                text,
+                src=src,
+                tgt=tgt,
+                context=context,
+                glossary=glossary,
+                length_budget_s=length_budget_s,
+                dialogue=dialogue,
+                speaker=speaker,
+                upcoming=upcoming,
+                hypotheses=hypotheses,
+                uncertain_words=uncertain_words,
+            )
+        )[0]
+
+    async def translate_ex(
+        self,
+        text: str,
+        *,
+        src: str,
+        tgt: str,
+        context: list[ContextPair],
+        glossary: dict[str, str],
+        length_budget_s: float | None = None,
+        dialogue: list[DialogueLine] | None = None,
+        speaker: str | None = None,
+        upcoming: list[UpcomingLine] | None = None,
+        hypotheses: list[str] | None = None,
+        uncertain_words: list[str] | None = None,
+    ) -> tuple[str, str | None, float | None]:
+        """1차 번역 (번역, 고른/교정한 원문 또는 None, 확신도 또는 None). 후보·불확실 단어가 있으면 모델이 읽기를 고르고
+        확신도를 돌려준다 (문맥 재채점, S-30); 없으면 평소처럼 번역만."""
         messages = build_messages(
             text,
             src=src,
@@ -245,8 +306,10 @@ class OllamaTranslator:
             dialogue=dialogue,
             speaker=speaker,
             upcoming=upcoming,
+            hypotheses=hypotheses,
+            uncertain_words=uncertain_words,
         )
-        return (await self._ask(messages, tgt))[0]
+        return await self._ask(messages, tgt)
 
     async def revise(
         self,
@@ -259,8 +322,10 @@ class OllamaTranslator:
         dialogue: list[DialogueLine] | None = None,
         speaker: str | None = None,
         upcoming: list[UpcomingLine] | None = None,
-    ) -> tuple[str, str | None]:
-        """2차 패스: 앞뒤 문맥으로 다시 번역하고 교정 원문도 받는다 → (번역, 교정 원문 또는 None)."""
+        hypotheses: list[str] | None = None,
+        uncertain_words: list[str] | None = None,
+    ) -> tuple[str, str | None, float | None]:
+        """2차 패스: 앞뒤 문맥으로 다시 번역하고 교정 원문·확신도도 받는다 → (번역, 교정 원문 또는 None, 확신도)."""
         messages = build_messages(
             text,
             src=src,
@@ -271,18 +336,22 @@ class OllamaTranslator:
             speaker=speaker,
             upcoming=upcoming,
             want_source=True,
+            hypotheses=hypotheses,
+            uncertain_words=uncertain_words,
         )
         return await self._ask(messages, tgt)
 
-    async def _ask(self, messages: list[dict[str, str]], tgt: str) -> tuple[str, str | None]:
-        """모델에 묻고 (번역, 교정 원문) 을 돌려준다. 형식·문자 체계가 어긋나면 한 번 고쳐 달라고 한다."""
+    async def _ask(
+        self, messages: list[dict[str, str]], tgt: str
+    ) -> tuple[str, str | None, float | None]:
+        """모델에 묻고 (번역, 교정 원문, 확신도) 를 돌려준다. 형식·문자 체계가 어긋나면 한 번 고쳐 달라고 한다."""
         why = "형식 오류"
         for attempt in range(2):
             content = await self._chat(messages)
-            out, fixed = parse_result(content)
+            out, fixed, conf = parse_result(content)
             problem = None if out is None else script_problem(out, tgt)
             if out is not None and problem is None:
-                return out, fixed
+                return out, fixed, conf
             why = "형식 오류" if out is None else problem
             log.warning("Ollama 번역 %s (시도 %d): %r", why, attempt + 1, content[:120])
             fix = (

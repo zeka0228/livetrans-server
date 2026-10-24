@@ -87,11 +87,14 @@ def test_build_messages_second_pass_asks_for_corrected_source():
 
 
 def test_parse_result_returns_translation_and_optional_source():
-    assert parse_result('{"translation": "見る？", "source": "볼래?"}') == ("見る？", "볼래?")
-    assert parse_result('{"translation": "見る？"}') == ("見る？", None)
-    assert parse_result('{"translation": "見る？", "source": "  "}') == ("見る？", None)
-    assert parse_result('{"source": "볼래?"}') == (None, None)
-    assert parse_result("garbage") == (None, None)
+    assert parse_result('{"translation": "見る？", "source": "볼래?"}') == ("見る？", "볼래?", None)
+    assert parse_result('{"translation": "見る？"}') == ("見る？", None, None)
+    assert parse_result('{"translation": "見る？", "source": "  "}') == ("見る？", None, None)
+    assert parse_result('{"source": "볼래?"}') == (None, None, None)
+    assert parse_result("garbage") == (None, None, None)
+    assert parse_result('{"translation": "見る？", "confidence": 0.8}') == ("見る？", None, 0.8)
+    assert parse_result('{"translation": "見る？", "confidence": "high"}') == ("見る？", None, None)
+    assert parse_result('{"translation": "見る？", "confidence": 7}') == ("見る？", None, 1.0)
 
 
 async def test_ollama_revise_returns_translation_and_source():
@@ -119,11 +122,39 @@ async def test_ollama_revise_returns_translation_and_source():
         speaker="S1",
         upcoming=[("S0", "액션으로")],
     )
-    assert out == ("一緒に見る？", "같이 볼래?")
+    assert out == ("一緒に見る？", "같이 볼래?", None)
     system = seen["body"]["messages"][0]["content"]
     assert (
         "second pass" in system and "Recent dialogue" in system and "spoken right after" in system
     )
+
+
+def test_build_messages_lists_hypotheses_and_uncertain_words_and_asks_confidence():
+    msgs = build_messages(
+        "그 키 어디 있어",
+        src="ko",
+        tgt="en",
+        context=[],
+        glossary={},
+        hypotheses=["그 키 어디 있어", "그 캐 어디 있어", "그 키 어디 이써"],
+        uncertain_words=["캐"],
+    )
+    system = msgs[0]["content"]
+    assert (
+        "alternative transcriptions" in system
+        and "1) 그 키 어디 있어" in system
+        and "2) 그 캐 어디 있어" in system
+    )
+    assert 'Low-confidence words in the current line: "캐"' in system
+    assert (
+        '"confidence": <0-1>' in system and '"source"' in system
+    )  # 후보가 있으면 원문·확신도도 요청
+    plain = build_messages("hi", src="en", tgt="ko", context=[], glossary={})[0]["content"]
+    assert "alternative transcriptions" not in plain and "confidence" not in plain
+    one = build_messages("hi", src="en", tgt="ko", context=[], glossary={}, hypotheses=["hi"])[0][
+        "content"
+    ]
+    assert "alternative transcriptions" not in one  # 후보가 하나뿐이면 재채점 블록 없음
 
 
 def test_parse_translation_accepts_json_and_rejects_garbage():

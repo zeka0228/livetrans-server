@@ -53,8 +53,8 @@ class FakeTranslator:
         return f"[{src}->{tgt}] {text}"
 
 
-def run(translator, *, src_lang="ja", stream=True, glossary=None):
-    stt = FakeSTT(lang="ja")
+def run(translator, *, src_lang="ja", stream=True, glossary=None, stt=None):
+    stt = stt or FakeSTT(lang="ja")
     settings = Settings(
         stt=SttConfig(engine="fake"),
         diar=DiarConfig(engine="fake" if stream else "none"),
@@ -233,8 +233,8 @@ class RevisingFakeTranslator(DialogueFakeTranslator):
             {"text": text, "speaker": speaker, "upcoming": list(upcoming or [])}
         )
         if not self.change:
-            return f"[{src}->{tgt}] {text}", text
-        return f"[rev] {text}", text.replace("확정", "교정")
+            return f"[{src}->{tgt}] {text}", text, 0.9
+        return f"[rev] {text}", text.replace("확정", "교정"), 0.9
 
 
 def _updates(events, kind):
@@ -286,3 +286,80 @@ def test_engine_without_revise_skips_second_pass():
     mt = DialogueFakeTranslator()
     _, events = run(mt)
     assert not _updates(events, "translation.update") and not _updates(events, "segment.update")
+
+
+class RescoringFakeTranslator(DialogueFakeTranslator):
+    """후보(hypotheses)를 받아 2번째 후보를 고르고 확신도를 돌려주는 엔진 (translate_ex)."""
+
+    def __init__(self, *, confidence=0.9):
+        super().__init__()
+        self.confidence = confidence
+
+    async def translate_ex(
+        self,
+        text,
+        *,
+        src,
+        tgt,
+        context,
+        glossary,
+        length_budget_s=None,
+        hypotheses=None,
+        uncertain_words=None,
+        **kw,
+    ):
+        out = await super().translate(
+            text,
+            src=src,
+            tgt=tgt,
+            context=context,
+            glossary=glossary,
+            length_budget_s=length_budget_s,
+        )
+        self.calls[-1]["hypotheses"] = list(hypotheses or [])
+        self.calls[-1]["uncertain_words"] = list(uncertain_words or [])
+        picked = hypotheses[1] if hypotheses and len(hypotheses) > 1 else None
+        return out, picked, self.confidence
+
+
+def test_rescoring_picks_alternative_hypothesis_and_reports_confidence():
+    stt = FakeSTT(lang="ja", alternatives=[("발화 0 확정 (2400 ns)", -0.3)])
+    mt = RescoringFakeTranslator(confidence=0.9)
+    _, events = run(mt, stt=stt)
+    finals = [e["payload"] for e in events if e["type"] == "segment.final"]
+    trs = [e["payload"] for e in events if e["type"] == "translation.final"]
+    assert mt.calls[0]["hypotheses"] == [finals[0]["text"], "발화 0 확정 (2400 ns)"]
+    assert all(t["confidence"] == 0.9 and "uncertain" not in t for t in trs)
+    ups = [
+        e["payload"]
+        for e in events
+        if e["type"] == "segment.update" and e["payload"]["reason"] == "hypothesis"
+    ]
+    assert (
+        ups
+        and ups[0]["seg_id"] == finals[0]["seg_id"]
+        and ups[0]["text"] == "발화 0 확정 (2400 ns)"
+    )
+    assert ups[0]["prev_text"] == finals[0]["text"]
+    # 갱신은 그 발화의 translation.final 바로 뒤
+    i_final = next(
+        i
+        for i, e in enumerate(events)
+        if e["type"] == "translation.final" and e["payload"]["seg_id"] == finals[0]["seg_id"]
+    )
+    i_up = next(
+        i
+        for i, e in enumerate(events)
+        if e["type"] == "segment.update" and e["payload"]["seg_id"] == finals[0]["seg_id"]
+    )
+    assert i_up == i_final + 1
+
+
+def test_low_confidence_marks_translation_uncertain():
+    mt = RescoringFakeTranslator(confidence=0.2)
+    _, events = run(mt)  # 후보 없음 → 재채점 없음이지만 엔진이 확신도를 주면 그대로 싣는다
+    trs = [e["payload"] for e in events if e["type"] == "translation.final"]
+    assert trs and all(t["confidence"] == 0.2 and t["uncertain"] is True for t in trs)
+    assert not [
+        e for e in events if e["type"] == "segment.update"
+    ]  # 고른 후보가 없으니 원문 갱신 없음

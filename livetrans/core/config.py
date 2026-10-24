@@ -59,6 +59,12 @@ class SttConfig(BaseModel):
     compute_type: str = "float16"
     beam_final: int = 5
     beam_partial: int = 1
+    # 두 번째 의견: 확정 인식 뒤 다른 엔진(구조 엔진·라우팅 상대)으로 한 번 더 인식해 결과가 다르면 번역 단계에 후보로 넘긴다
+    # (엔진 불일치 = 불확실, S-30). DiCoW 는 n-best 를 못 내서(커스텀 generate) 이 방식을 쓴다. GPU ≈ +0.4 s/발화
+    # mode_a(지연 예산이 있는 모드 A 만) | always | off
+    second_opinion: str = "mode_a"
+    # 단어 확률이 이 미만이면 '불확실한 단어' 로 번역 프롬프트에 표시 (faster-whisper 단어 확률)
+    word_prob_low: float = 0.5
     language: str | None = None
 
 
@@ -160,6 +166,8 @@ class MtConfig(BaseModel):
     revise: bool = True
     revise_window_s: float = 10.0
     revise_max_edit: float = 0.5
+    # 모델이 돌려준 확신도(0~1)가 이 미만이면 translation.final 에 uncertain: true 를 붙인다 (앱이 흐리게 표시)
+    confidence_low: float = 0.5
     # 추론(thinking) 모델의 사고 출력 끄기. 2026-10-25 벤치: qwen3:14b·gemma4 는 켜진 채로는 사고에 토큰을 다 써 40문장 중
     # 35~39개가 빈 출력(7 s), 끄면 0.3 s 에 정상 출력. 비추론 모델(gemma2 등)에는 영향 없음
     think: bool = False

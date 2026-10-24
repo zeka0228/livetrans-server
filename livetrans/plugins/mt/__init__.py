@@ -98,6 +98,28 @@ def context_kwargs(engine, *, dialogue, speaker, upcoming) -> dict:
     return out
 
 
+def filter_kwargs(fn, **candidates) -> dict:
+    """fn 의 시그니처가 받는 키워드 인자만 남긴다 (**kwargs 를 받으면 전부). 값이 None 인 것은 뺀다."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return {k: val for k, val in candidates.items() if val is not None}
+    return {k: val for k, val in candidates.items() if k in params and val is not None}
+
+
+def hypothesis_kwargs(engine, *, hypotheses, uncertain_words) -> dict:
+    """엔진이 받는 재채점 인자만 (hypotheses·uncertain_words)."""
+    params = _translate_params(engine)
+    out: dict = {}
+    if hypotheses and "hypotheses" in params:
+        out["hypotheses"] = hypotheses
+    if uncertain_words and "uncertain_words" in params:
+        out["uncertain_words"] = uncertain_words
+    return out
+
+
 class FallbackTranslator:
     """엔진 체인: 앞 엔진이 로드에 실패하면 빼고, 번역에 실패하면 다음 엔진으로. `fallback` 플래그를 Translation 에 남긴다."""
 
@@ -179,21 +201,40 @@ class FallbackTranslator:
         speaker: str | None = None,
         dialogue: list | None = None,
         upcoming: list | None = None,
+        hypotheses: list | None = None,
+        uncertain_words: list | None = None,
     ) -> Translation:
         t0 = time.perf_counter()
         last: Exception | None = None
         for i, e in enumerate(self.active):
             try:
                 extra = context_kwargs(e, dialogue=dialogue, speaker=speaker, upcoming=upcoming)
-                out = await e.translate(
-                    text,
-                    src=src,
-                    tgt=tgt,
-                    context=context,
-                    glossary=glossary,
-                    length_budget_s=length_budget_s,
-                    **extra,
+                extra |= hypothesis_kwargs(
+                    e, hypotheses=hypotheses, uncertain_words=uncertain_words
                 )
+                fixed: str | None = None
+                conf: float | None = None
+                ex = getattr(e, "translate_ex", None)
+                if ex is not None:
+                    out, fixed, conf = await ex(
+                        text,
+                        src=src,
+                        tgt=tgt,
+                        context=context,
+                        glossary=glossary,
+                        length_budget_s=length_budget_s,
+                        **extra,
+                    )
+                else:
+                    out = await e.translate(
+                        text,
+                        src=src,
+                        tgt=tgt,
+                        context=context,
+                        glossary=glossary,
+                        length_budget_s=length_budget_s,
+                        **extra,
+                    )
                 return Translation(
                     seg_id=seg_id,
                     text=out,
@@ -203,13 +244,15 @@ class FallbackTranslator:
                     fallback=i > 0,
                     latency_ms=int((time.perf_counter() - t0) * 1000),
                     speaker=speaker,
+                    source_fixed=fixed if fixed and fixed.strip() != text.strip() else None,
+                    confidence=conf,
                 )
             except Exception as err:  # noqa: BLE001
                 last = err
                 log.warning("번역 실패 %s seg=%s → 다음 엔진: %s", e.name, seg_id, err)
         raise TranslationError(f"모든 번역 엔진 실패: {last}")
 
-    async def revise(self, text: str, **kw) -> tuple[str, str | None] | None:
+    async def revise(self, text: str, **kw) -> tuple[str, str | None, float | None] | None:
         """2차 패스를 지원하는 첫 활성 엔진(Ollama)으로. 지원 엔진이 없으면 None (2차 패스 생략)."""
         for e in self.active:
             fn = getattr(e, "revise", None)

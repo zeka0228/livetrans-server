@@ -44,7 +44,7 @@ from livetrans.pipeline.lanes import LanePartial, LaneSegmenter, LaneUtterance
 from livetrans.pipeline.segmenter import PartialRequest, Segmenter, SpeechSegment
 from livetrans.pipeline.timeline import Composer, DeadlineEvent, OutputRing, Timeline
 from livetrans.plugins.diar.base import Diarizer
-from livetrans.plugins.mt import FallbackTranslator, context_kwargs, load_glossary
+from livetrans.plugins.mt import FallbackTranslator, filter_kwargs, load_glossary
 from livetrans.plugins.mt.base import Translation, TranslationError, Translator
 from livetrans.plugins.source.base import Source
 from livetrans.plugins.source.loopback import CaptureError
@@ -177,9 +177,8 @@ class Session:
         # 번역 (명세 §4.4): 확정 자막마다 비동기로 번역해 translation.final. 화자별 문맥 쌍 유지
         self.translator = translator
         self._mt_cfg = settings.mt
-        self._mt_queue: asyncio.Queue[tuple[int, str | None, str, str, int, int] | None] = (
-            asyncio.Queue()
-        )
+        self._stt_cfg = settings.stt
+        self._mt_queue: asyncio.Queue[tuple | None] = asyncio.Queue()
         self._mt_context: dict[str | None, deque[tuple[str, str]]] = {}
         # 최근 대화 (모든 화자: 화자, 원문, 번역) — 번역 프롬프트의 대화 문맥 (mt.dialogue_lines, 0 = 끔)
         self._dialogue: deque[tuple[str | None, str, str]] = deque(
@@ -910,9 +909,17 @@ class Session:
                     None
                 )  # 번역이 끝나면 2차 패스도 남은 것만 하고 끝낸다
                 return
-            seg_id, speaker, text, lang, t_start_ms, t_end_ms = item
+            seg_id, speaker, text, lang, t_start_ms, t_end_ms, hyps, unsure = item
             upcoming = await self._wait_lookahead(seg_id, t_start_ms)
-            tr = await self._translate_one(seg_id, speaker, text, lang, upcoming=upcoming)
+            tr = await self._translate_one(
+                seg_id,
+                speaker,
+                text,
+                lang,
+                upcoming=upcoming,
+                hypotheses=hyps,
+                uncertain_words=unsure,
+            )
             if tr is not None and self._mt_cfg.revise:
                 self._mt_done[(seg_id, speaker)] = {
                     "speaker": speaker,
@@ -922,9 +929,15 @@ class Session:
                     "t_start_ms": t_start_ms,
                     "t_end_ms": t_end_ms,
                     "upcoming_n": len(upcoming or []),
+                    "hypotheses": hyps,
+                    "uncertain_words": unsure,
                     "at": time.time(),
                     "revised": False,
                 }
+                if (
+                    tr.source_fixed
+                ):  # 모델이 다른 후보/교정 읽기를 골랐다 → 원문 갱신 (기록도 그 읽기로)
+                    self._mt_done[(seg_id, speaker)]["text"] = tr.source_fixed
                 if len(self._mt_done) > MT_SEEN_MAX:
                     self._mt_done.pop(next(iter(self._mt_done)))
                 self._schedule_revisions(exclude=(seg_id, speaker))  # 이미 뒤 발화가 와 있으면 바로
@@ -943,10 +956,14 @@ class Session:
         lang: str,
         t_start_ms: int = 0,
         t_end_ms: int = 0,
+        hypotheses: list[str] | None = None,
+        uncertain_words: list[str] | None = None,
     ) -> None:
         if text:
             self._mt_seen.append((seg_id, speaker, text))
-            self._mt_queue.put_nowait((seg_id, speaker, text, lang, t_start_ms, t_end_ms))
+            self._mt_queue.put_nowait(
+                (seg_id, speaker, text, lang, t_start_ms, t_end_ms, hypotheses, uncertain_words)
+            )
             self._mt_new.set()
             self._schedule_revisions(exclude=(seg_id, speaker))
 
@@ -993,13 +1010,18 @@ class Session:
             tgt=tgt,
             context=list(self._mt_context.get(speaker, ())),
             glossary=self._glossary(src) if src != tgt else {},
-            dialogue=list(self._dialogue) if self._dialogue_on else None,
-            speaker=speaker,
-            upcoming=upcoming,
+            **filter_kwargs(  # 엔진이 받는 문맥 인자만
+                revise,
+                dialogue=list(self._dialogue) if self._dialogue_on else None,
+                speaker=speaker,
+                upcoming=upcoming,
+                hypotheses=rec.get("hypotheses"),
+                uncertain_words=rec.get("uncertain_words"),
+            ),
         )
         if result is None:
             return
-        new_tr, fixed_src = result
+        new_tr, fixed_src, *_ = result  # (번역, 교정 원문[, 확신도])
         base = {"seg_id": seg_id, "reason": "context"}
         if speaker is not None:
             base["speaker"] = speaker
@@ -1081,6 +1103,8 @@ class Session:
         text: str,
         lang: str,
         upcoming: list[tuple[str | None, str]] | None = None,
+        hypotheses: list[str] | None = None,
+        uncertain_words: list[str] | None = None,
     ) -> Translation | None:
         src = (lang or "").split("-")[0].lower()
         if self.translator is None or not src or src == self.tgt_lang:
@@ -1104,19 +1128,31 @@ class Session:
                         speaker=speaker,
                         dialogue=dialogue,
                         upcoming=upcoming,
+                        hypotheses=hypotheses,
+                        uncertain_words=uncertain_words,
                     )
                 else:
                     t0 = asyncio.get_running_loop().time()
-                    extra = context_kwargs(
-                        self.translator, dialogue=dialogue, speaker=speaker, upcoming=upcoming
+                    # translate_ex(번역·고른 원문·확신도)가 있으면 그것을, 아니면 translate. 엔진이 받는 문맥 인자만 넘긴다
+                    fn = getattr(self.translator, "translate_ex", None) or self.translator.translate
+                    extra = filter_kwargs(
+                        fn,
+                        dialogue=dialogue,
+                        speaker=speaker,
+                        upcoming=upcoming,
+                        hypotheses=hypotheses,
+                        uncertain_words=uncertain_words,
                     )
-                    out = await self.translator.translate(
+                    res = await fn(
                         text,
                         src=src,
                         tgt=self.tgt_lang,
                         context=context,
                         glossary=glossary,
                         **extra,
+                    )
+                    out, fixed, conf = (
+                        (*res, None, None)[:3] if isinstance(res, tuple) else (res, None, None)
                     )
                     tr = Translation(
                         seg_id,
@@ -1127,6 +1163,8 @@ class Session:
                         False,
                         int((asyncio.get_running_loop().time() - t0) * 1000),
                         speaker,
+                        source_fixed=fixed if fixed and fixed.strip() != text.strip() else None,
+                        confidence=conf,
                     )
             except TranslationError as e:
                 log.warning("번역 실패 seg=%s → 원문: %s", seg_id, e)
@@ -1151,7 +1189,31 @@ class Session:
         }
         if speaker is not None:
             payload["speaker"] = speaker
+        if tr.confidence is not None:  # 문맥 재채점 (S-30): 모델 확신도, 낮으면 uncertain
+            payload["confidence"] = round(tr.confidence, 2)
+            if tr.confidence < self._mt_cfg.confidence_low:
+                payload["uncertain"] = True
         self._emit("translation.final", payload)
+        if (
+            tr.source_fixed
+            and _changed(text, tr.source_fixed)
+            and _acceptable_fix(text, tr.source_fixed, self._mt_cfg.revise_max_edit)
+        ):
+            # 모델이 다른 후보/교정 읽기를 골랐다: 원문 자막을 바로 갱신 (앱: (seg_id, speaker) 줄 교체)
+            upd = {
+                "seg_id": tr.seg_id,
+                "text": tr.source_fixed,
+                "prev_text": text,
+                "reason": "hypothesis",
+            }
+            if speaker is not None:
+                upd["speaker"] = speaker
+            self._emit("segment.update", upd)
+            if self.composer is not None:
+                self.composer.replace_cue(tr.seg_id, "src", speaker, tr.source_fixed)
+            if self._dialogue_on and self._dialogue and self._dialogue[-1][1] == text:
+                spk, _, trs = self._dialogue[-1]
+                self._dialogue[-1] = (spk, tr.source_fixed, trs)
         if tr.engine != "passthrough":
             self._lat["mt"].append(tr.latency_ms)
         return tr
@@ -1228,6 +1290,7 @@ class Session:
         for speaker in targets:
             got = await self._transcribe_final(seg, speaker, engine)
             if got is not None:
+                await self._second_opinion(seg, got[0], engine)
                 results.append((speaker, *got))
         self._final_done.add(seg.seg_id)
         if not results:
@@ -1244,9 +1307,47 @@ class Session:
             self._add_cue(
                 "src", seg.seg_id, payload["t_start_ms"], payload["t_end_ms"], tr.text, shown
             )
-            self._queue_translation(
-                seg.seg_id, shown, tr.text, tr.lang, payload["t_start_ms"], payload["t_end_ms"]
+            # 문맥 재채점 재료 (S-30): n-best 후보(1위 포함, 중복 제거)와 저확률 단어
+            hyps = (
+                [tr.text, *(alt for alt, _ in tr.alternatives if alt)] if tr.alternatives else None
             )
+            unsure = [
+                w.text for w in tr.words if w.prob < self._stt_cfg.word_prob_low and w.text.strip()
+            ] or None
+            self._queue_translation(
+                seg.seg_id,
+                shown,
+                tr.text,
+                tr.lang,
+                payload["t_start_ms"],
+                payload["t_end_ms"],
+                hypotheses=hyps,
+                uncertain_words=unsure,
+            )
+
+    async def _second_opinion(self, seg: SpeechSegment, tr: Transcript, engine: STTEngine) -> None:
+        """다른 엔진으로 같은 구간을 한 번 더 인식해 결과가 다르면 `tr.alternatives` 에 후보로 넣는다 (S-30).
+
+        엔진 둘이 다르게 들은 곳이 곧 불확실한 곳 — 번역 단계가 대화 문맥으로 더 그럴듯한 쪽을 고른다. 모드 A 만(기본)
+        또는 항상. 0.8 s 미만·빈 결과는 건너뛴다. 실패는 무시.
+        """
+        mode = self._stt_cfg.second_opinion
+        if mode == "off" or (mode == "mode_a" and self.mode != "A") or not tr.text:
+            return
+        if seg.t_end_ms - seg.t_start_ms < 800:
+            return
+        other = next((e for e in self._engines.values() if e is not engine), None)
+        if other is None:
+            return
+        try:
+            alt = await other.transcribe(seg, lang=tr.lang, prompt=None, final=True, speaker=None)
+        except Exception as e:  # noqa: BLE001 — 두 번째 의견은 보조 정보
+            log.debug("두 번째 의견 실패 seg=%s (%s): %s", seg.seg_id, other.name, e)
+            return
+        if alt.text and _changed(alt.text, tr.text):
+            tr.alternatives.append((alt.text, 0.0))
+            # 두 번째 엔진이 단어 확률을 주면(faster-whisper) 낮은 것을 불확실 단어로 보탠다
+            tr.words = tr.words or [w for w in alt.words if w.prob < self._stt_cfg.word_prob_low]
 
     async def _attach_speakers(self, seg: SpeechSegment) -> int | None:
         """Diarizer 로 화자 구간을 받아 발화에 붙인다. 실패하면 화자 없이 진행 (경고만)."""

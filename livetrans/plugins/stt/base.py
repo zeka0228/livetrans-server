@@ -26,6 +26,8 @@ class Transcript:
     avg_logprob: float = 0.0
     latency_ms: int = 0
     speaker: str | None = None  # v0.4: 화자 조건부 엔진이면 대상 화자, 아니면 None
+    # n-best 대안 (text, score) — 1위(text)를 뺀 나머지, 점수 내림차순. 번역 단계의 문맥 재채점용 (S-30)
+    alternatives: list[tuple[str, float]] = field(default_factory=list)
 
 
 class STTEngine(Protocol):

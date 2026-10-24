@@ -18,6 +18,10 @@ class Translation:
     fallback: bool
     latency_ms: int
     speaker: str | None = None  # v0.4
+    source_fixed: str | None = (
+        None  # 모델이 고른/교정한 원문 (후보 재채점·2차 패스, S-30). 원문과 같으면 None
+    )
+    confidence: float | None = None  # 모델 확신도 0~1 (요청했을 때만)
 
 
 class TranslationError(RuntimeError):

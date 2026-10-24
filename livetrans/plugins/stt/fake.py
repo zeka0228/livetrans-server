@@ -15,11 +15,17 @@ class FakeSTT:
     supports_speaker_mask = True
 
     def __init__(
-        self, *, latency_s: float = 0.0, lang: str = "ko", lang_prob: float = 0.99
+        self,
+        *,
+        latency_s: float = 0.0,
+        lang: str = "ko",
+        lang_prob: float = 0.99,
+        alternatives: list[tuple[str, float]] | None = None,
     ) -> None:
         self.latency_s = latency_s
         self.lang = lang
         self.lang_prob = lang_prob
+        self.alternatives = list(alternatives or [])  # 확정 결과에 붙일 n-best 대안
         self.calls: list[dict] = []
 
     async def load(self) -> None:
@@ -62,6 +68,7 @@ class FakeSTT:
             words=words,
             latency_ms=int(self.latency_s * 1000),
             speaker=speaker,
+            alternatives=list(self.alternatives) if final else [],
         )
 
     async def close(self) -> None:

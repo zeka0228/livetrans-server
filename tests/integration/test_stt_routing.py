@@ -31,13 +31,22 @@ class Alt(FakeSTT):
     supports_speaker_mask = False
 
 
-def make_app(route=None, primary_lang="ko"):
+def make_app(route=None, primary_lang="ko", second_opinion="off", translator=None):
     settings = Settings(
-        stt=SttConfig(engine="fake", route_by_lang=route if route is not None else {})
+        stt=SttConfig(
+            engine="fake",
+            route_by_lang=route if route is not None else {},
+            second_opinion=second_opinion,
+        )
     )
     primary, alt = Primary(lang=primary_lang), Alt(lang=primary_lang)
     app = create_app(
-        settings, stt=primary, vad_factory=lambda: energy_vad, tts_engines={}, stt_rescue=alt
+        settings,
+        stt=primary,
+        vad_factory=lambda: energy_vad,
+        tts_engines={},
+        stt_rescue=alt,
+        translator=translator,
     )
     return app, primary, alt
 
@@ -121,3 +130,65 @@ def test_unknown_stt_engine_is_rejected():
     with TestClient(app) as client:
         r, _ = run(client, {"stt": {"engine": "whisperx"}})
     assert r.status_code == 400 and r.json()["detail"]["code"] == "E_STT_ENGINE"
+
+
+class HypothesisCapture:
+    """후보(hypotheses)를 받는 번역 엔진 — 두 번째 의견이 번역 단계까지 닿는지 본다."""
+
+    name = "cap"
+    model_id = "cap"
+
+    def __init__(self):
+        self.hyps = []
+
+    async def load(self):
+        return None
+
+    async def health(self):
+        return True
+
+    async def close(self):
+        return None
+
+    async def translate(
+        self, text, *, src, tgt, context, glossary, length_budget_s=None, hypotheses=None, **_
+    ):
+        self.hyps.append(list(hypotheses or []))
+        return f"[{src}->{tgt}] {text}"
+
+
+class AltText(Alt):
+    async def transcribe(self, seg, *, lang, prompt, final, speaker=None, anti_repeat=False):
+        tr = await super().transcribe(
+            seg, lang=lang, prompt=prompt, final=final, speaker=speaker, anti_repeat=anti_repeat
+        )
+        tr.text = tr.text.replace("확정", "학정")  # 두 번째 엔진은 한 글자를 다르게 듣는다
+        return tr
+
+
+def test_second_opinion_adds_other_engine_reading_as_hypothesis():
+    cap = HypothesisCapture()
+    settings = Settings(stt=SttConfig(engine="fake", second_opinion="always"))
+    primary, alt = Primary(lang="en"), AltText(lang="en")
+    app = create_app(
+        settings,
+        stt=primary,
+        vad_factory=lambda: energy_vad,
+        tts_engines={},
+        stt_rescue=alt,
+        translator=cap,
+    )
+    with TestClient(app) as client:
+        _, finals = run(client, {}, src_lang="en")
+    assert finals and finals_of(alt)  # 두 번째 엔진이 확정마다 한 번 더 불렸다
+    assert all(len(h) == 2 and h[1] == h[0].replace("확정", "학정") for h in cap.hyps if h)
+    assert cap.hyps and cap.hyps[0]
+
+
+def test_second_opinion_off_by_default_outside_mode_a():
+    cap = HypothesisCapture()
+    # second_opinion 기본은 mode_a → 모드 C 에서는 안 돈다
+    app, _primary, alt = make_app(translator=cap)
+    with TestClient(app) as client:
+        _, finals = run(client, {}, src_lang="en")
+    assert finals and not finals_of(alt) and all(h == [] for h in cap.hyps)
