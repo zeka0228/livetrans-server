@@ -81,3 +81,37 @@ def test_flush_closes_open_utterance():
     utts = lane.flush()
     assert [(u.seg_id, u.t_start_ms, u.t_end_ms) for u in utts] == [(0, 0, 1100)]
     assert lane.flush() == []
+
+
+def test_short_fragment_merges_into_next_utterance():
+    lane = make()  # lane_min_speech 400, lane_merge_gap 1500
+    assert lane.push([(1000, 1300)], 1300) == []  # 300 ms 조각
+    assert lane.push([], 2000) == []  # 무음 700 ms → 닫히지만 내보내지 않고 보류
+    assert lane.open_span is None
+    assert lane.push([(2200, 3200)], 3200) == []  # 틈 900 ms ≤ 1500 → 조각을 앞에 붙여 새 발화
+    assert lane.open_span[1:] == (800, 3200)
+    utts = lane.push([], 4000)
+    assert [(u.t_start_ms, u.t_end_ms) for u in utts] == [(800, 3400)]
+    assert [(t.t_start_ms, t.t_end_ms) for t in utts[0].turns] == [(1000, 1300), (2200, 3200)]
+
+
+def test_short_fragment_without_following_speech_is_dropped():
+    lane = make()
+    lane.push([(1000, 1300)], 1300)
+    assert lane.push([], 2000) == []
+    assert lane.push([(4000, 5000)], 5000) == []  # 틈 2700 ms > 1500 → 조각 버림
+    assert lane.open_span[1:] == (3800, 5000)
+    assert lane.flush()[0].turns[0].t_start_ms == 4000
+
+
+def test_short_fragment_at_end_is_dropped_on_flush():
+    lane = make()
+    lane.push([(1000, 1300)], 1300)
+    assert lane.flush() == []
+    assert lane.flush() == []
+
+
+def test_fragment_threshold_is_configurable():
+    lane = make(lane_min_speech_ms=250)  # 예전 동작: 300 ms 도 바로 내보낸다
+    lane.push([(1000, 1300)], 1300)
+    assert [(u.t_start_ms, u.t_end_ms) for u in lane.push([], 2000)] == [(800, 1500)]

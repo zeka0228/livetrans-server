@@ -34,6 +34,10 @@ class VadConfig(BaseModel):
     min_silence_ms: int = 600
     speech_pad_ms: int = 200
     max_utterance_s: float = 8.0
+    # 화자 레인(D-028) 경계 조각: 이보다 짧게 말한 발화는 바로 내보내지 않고 같은 화자의 다음 발화(틈 ≤ lane_merge_gap_ms)에
+    # 붙인다. 다음 발화가 없으면 버린다. 2026-10-25: 0.4 s 조각("sigum")이 그대로 번역·TTS 까지 가던 문제
+    lane_min_speech_ms: int = 400
+    lane_merge_gap_ms: int = 1500
 
 
 class SttConfig(BaseModel):
@@ -47,6 +51,10 @@ class SttConfig(BaseModel):
         None  # 환각 판정 시 그 발화만 다시 인식할 구조 엔진 (기본 엔진과 함께 로드, VRAM 추가)
     )
     rescue_model: str = "large-v3"
+    # 언어별 라우팅 (세션 요청 stt.engine 이 "auto" 일 때): 지정/감지 언어 → 엔진 이름. 그 엔진이 기본 또는 구조 엔진으로
+    # 떠 있을 때만 적용된다. 2026-10-25 벤치: 한국어는 DiCoW 가 CER 0.011 vs fw 0.046 에 2배 빠르고 화자 마스크도 되어 유지,
+    # 일본어는 DiCoW 가 언어를 en 으로 오판(5건 중 3건 → 번역 src 가 틀어짐)해 fw 로. 일본어 방송은 src_lang=ja 지정 권장
+    route_by_lang: dict[str, str] = Field(default_factory=lambda: {"ja": "faster_whisper"})
     device: str = "cuda"
     compute_type: str = "float16"
     beam_final: int = 5
@@ -64,6 +72,9 @@ class DiarConfig(BaseModel):
     right_context_s: float = 2.0  # stream: 확정을 미루는 오른쪽 문맥 (C_diar)
     model: str = "pyannote/speaker-diarization-community-1"
     device: str = "cuda"
+    # 분할·임베딩 추론 배치. 2026-10-25 측정(120 s 창): 32 → 창당 피크 1.6 GB, 스트림 40 step 뒤 캐시 5.1 GB 예약;
+    # 8 → 피크 0.46 GB, 예약 0.8 GB, 속도 동일. VRAM 예약은 Windows 에서 프로세스 커밋(Private)에도 잡힌다
+    batch_size: int = 8
     max_speakers: int = 4  # 세션당 화자 상한
     max_speakers_per_seg: int = 2  # 구간당 동시 화자 상한 k (명세 Q11)
     match_threshold: float = 0.6  # 기존 화자로 볼 코사인 하한 (pyannote LDA 공간). 합성음 측정 2026-10-23: 같은 화자 0.79, 다른 화자 0.14~0.56
@@ -89,6 +100,9 @@ class TimelineConfig(BaseModel):
     guard_s: float = 1.0  # G
     default_delay_s: int = 36  # D 기본 (D-022 최악 가정). 테스트는 요청에서 작게
     ring_extra_s: float = 30.0  # 원본 출력 링버퍼 여유
+    # control start 뒤 첫 입력 소리가 이 시간 안에 안 오면 E_CAPTURE_START 로 끝낸다. SRT listener 는 OBS 가 붙을 때까지
+    # 소리가 없으므로, 타임라인(D)은 첫 소리가 도착한 순간부터 센다 (ERR-011)
+    input_wait_s: float = 90.0
     max_lag_s: float = (
         8.0  # 결과가 이보다 늦으면 버림 (L3). L_max(8 s) 발화가 D 부족 시에도 버려지지 않게
     )
@@ -121,7 +135,9 @@ class MtConfig(BaseModel):
     """번역 (명세 §4.4). 기본 Ollama 로컬 LLM, 실패하면 체인 → 마지막은 항상 원문(passthrough)."""
 
     engine: str = "passthrough"  # ollama_llm | passthrough. 모델 기본값은 passthrough(테스트가 네트워크를 안 타게), 저장소 default.yaml 이 ollama_llm 으로 켠다
-    model: str = "gemma2:9b"  # 2026-10-23 측정: 190~440 ms/문장(서버와 함께 100 % GPU, 6.3 GB), 한국어 자연스러움. qwen2.5:7b 는 한국어 출력 중 중국어로 샘
+    # 2026-10-25 벤치(40문장 chrF, 서버와 동시 100 % GPU): gemma4:e4b ja 56 / en 43, 0.2 s, VRAM 3.3 GB > gemma3:12b-it-qat 41/34, 1.0 s,
+    # 8.8 GB > gemma2:9b 39/24, 0.3 s, 6.3 GB. qwen2.5:7b 는 한국어 출력에 중국어가 샘. 추론 모델은 think=false 필수
+    model: str = "gemma4:e4b"
     url: str = "http://127.0.0.1:11434"
     fallback: list[str] = Field(default_factory=lambda: ["passthrough"])
     context_pairs: int = 3  # 화자별 직전 (원문, 번역) 쌍 수
@@ -144,6 +160,12 @@ class MtConfig(BaseModel):
     revise: bool = True
     revise_window_s: float = 10.0
     revise_max_edit: float = 0.5
+    # 추론(thinking) 모델의 사고 출력 끄기. 2026-10-25 벤치: qwen3:14b·gemma4 는 켜진 채로는 사고에 토큰을 다 써 40문장 중
+    # 35~39개가 빈 출력(7 s), 끄면 0.3 s 에 정상 출력. 비추론 모델(gemma2 등)에는 영향 없음
+    think: bool = False
+    # 러너가 모델 파일을 mmap 으로 열게 (Ollama 0.40 Windows 는 기본 `--load-mode none` 으로 6.3 GB 를 힙에 복사해
+    # 100 % GPU 인데도 RAM 12~16 GB 를 잡았다. 2026-10-25 측정: mmap 이면 WS 12.3 → 5.5 GB, 페이지 캐시라 회수 가능)
+    use_mmap: bool = True
 
 
 class LoggingConfig(BaseModel):

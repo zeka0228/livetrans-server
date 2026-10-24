@@ -3,7 +3,8 @@
 - `POST {url}/api/chat`, `format: "json"` 으로 **JSON 한 줄** `{"translation": "..."}` 만 받는다. 파싱 실패 시 1회 재시도 후 `TranslationError`.
 - 프롬프트: 역할(생방송 자막 번역가) + 원어·대상어 + 용어집 + 직전 문맥 쌍(화자별, 세션이 넘김) + 원문.
 - `keep_alive` 로 모델을 상주시킨다. 첫 호출(모델 로드)만 수 초.
-- 2026-10-23 측정 (RTX 4070 Ti SUPER, 서버와 동시 상주): **gemma2:9b 190~440 ms/문장, 6.3 GB, 한국어 자연스러움 (기본)**. qwen2.5:7b 는 더 작지만
+- 2026-10-25 벤치 (RTX 4070 Ti SUPER, 서버와 동시 상주, 40문장 chrF ja/en): **gemma4:e4b 56/43, 0.2 s, 3.3 GB (기본, think=false)**,
+  gemma3:12b-it-qat 41/34 1.0 s 8.8 GB, gemma2:9b 39/24 0.3 s 6.3 GB (2026-10-23 까지 기본). qwen2.5:7b 는 더 작지만
   한국어 출력 중 중국어로 새는 일이 잦고(`script_problem` 으로 걸러 폴백), qwen2.5:3b 는 오역, gemma4:e4b 는 JSON 강제가 안 됨. 모델은 `mt.model`.
   VRAM 이 모자라면(다른 Ollama 모델이 함께 올라와 있으면) CPU 로 밀려 수 초가 걸린다 — `ollama ps` 로 100 % GPU 인지 확인.
 - Ollama 는 별도 프로세스가 GPU 를 쓴다 → `GPU_LOCK` 밖. VRAM 예산(§10)에 모델 크기만큼 더해 잡아야 한다 (7b Q4 ≈ 5 GB).
@@ -207,6 +208,20 @@ class OllamaTranslator:
         except httpx.HTTPError:
             return False
 
+    async def list_models(self) -> list[dict]:
+        """Ollama 에 설치된 모델 (세션 요청 `mt.model` 후보, API 계약 S-26). 못 받으면 빈 목록."""
+        try:
+            r = await self._client.get("/api/tags", timeout=3.0)
+            r.raise_for_status()
+        except httpx.HTTPError:
+            return []
+        out = []
+        for m in r.json().get("models", []):
+            name = m.get("name") or ""
+            if name and "embed" not in name:  # 임베딩 모델은 번역에 못 쓴다
+                out.append({"name": name, "size_mb": int(int(m.get("size", 0)) // (1024 * 1024))})
+        return out
+
     async def translate(
         self,
         text: str,
@@ -289,7 +304,13 @@ class OllamaTranslator:
             "stream": False,
             "format": "json",
             "keep_alive": self.cfg.keep_alive,
-            "options": {"temperature": self.cfg.temperature, "num_predict": self.cfg.max_tokens},
+            "think": self.cfg.think,  # 추론 모델의 사고 출력 (MtConfig.think). 비추론 모델은 무시한다
+            "options": {
+                "temperature": self.cfg.temperature,
+                "num_predict": self.cfg.max_tokens,
+                # 러너 로딩 방식 (MtConfig.use_mmap). 모델을 처음 올리는 요청에만 영향, 이후 요청은 무시된다
+                "use_mmap": self.cfg.use_mmap,
+            },
         }
         try:
             r = await self._client.post("/api/chat", json=body, timeout=self.cfg.timeout_s)

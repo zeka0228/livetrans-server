@@ -9,6 +9,7 @@ import pytest
 from livetrans.core.config import Settings, SttConfig, TimelineConfig
 from livetrans.core.voices import VoiceRegistry
 from livetrans.pipeline.session import Session
+from livetrans.plugins.diar.fake import FakeStreamDiarizer
 from livetrans.plugins.source.base import AudioFrame
 from livetrans.plugins.stt.fake import FakeSTT
 from livetrans.plugins.tts.fake import FakeTTS
@@ -22,9 +23,11 @@ class FakeLiveSource:
     name = "file"
     has_video = False
 
-    def __init__(self, audio: np.ndarray, chunk_ms: int = 100) -> None:
+    def __init__(self, audio: np.ndarray, chunk_ms: int = 100, first_delay_s: float = 0.0) -> None:
         self.audio = audio
         self.chunk = chunk_ms * 16
+        # 첫 프레임까지의 공백 (SRT listener 가 OBS 를 기다리는 상황)
+        self.first_delay_s = first_delay_s
         self.started = False
         self.stopped = False
         self.lost_reason = None
@@ -34,6 +37,10 @@ class FakeLiveSource:
 
     async def frames(self):
         t = 0
+        waited = 0.0
+        while waited < self.first_delay_s and not self.stopped:
+            await asyncio.sleep(0.05)
+            waited += 0.05
         for i in range(0, len(self.audio), self.chunk):
             if self.stopped:
                 return
@@ -195,6 +202,85 @@ async def test_mode_a_hls_start_failure_stops_session():
     assert errors and errors[0]["code"] == "E_OUTPUT_START" and not errors[0]["recoverable"]
     states = [e["payload"]["state"] for e in events if e["type"] == "session.state"]
     assert states[-1] == "stopped"
+
+
+def _mode_a_session(
+    source,
+    *,
+    session_id: str,
+    timeline: TimelineConfig | None = None,
+    delay=2.0,
+    stream_diarizer=None,
+):
+    settings = Settings(stt=SttConfig(engine="fake"), timeline=timeline or TimelineConfig())
+    return Session(
+        settings,
+        FakeSTT(),
+        energy_vad,
+        source,
+        mode="A",
+        src_lang=None,
+        session_id=session_id,
+        delay_s=delay,
+        hls_writer=FakeHls(),
+        stream_diarizer=stream_diarizer,
+    )
+
+
+@pytest.mark.parametrize("lanes", [False, True])
+async def test_mode_a_timeline_starts_at_first_input(lanes):
+    """ERR-011: 첫 소리가 올 때까지 starting 에 머물고, D 는 첫 소리 도착 시점부터 센다 (OBS 가 늦게 붙는 SRT listener).
+
+    일반 ingest 와 화자 레인(스트림) ingest 두 경로 모두 — 실서버 기본은 레인 경로라 둘 다 확인한다.
+    """
+    source = FakeLiveSource(tone(1.0), first_delay_s=0.8)
+    sd = FakeStreamDiarizer(lambda a, b: [("S0", a, b)]) if lanes else None
+    session = _mode_a_session(source, session_id="modea4", stream_diarizer=sd)
+    await session.start()
+    t_begin = time.time()
+    await session.begin()
+    await asyncio.sleep(0.4)
+    assert session.state == "starting" and session.timeline is None
+    await asyncio.sleep(0.8)
+    assert session.state == "buffering" and session.timeline is not None
+    assert session.timeline.start_wall - t_begin >= 0.7
+    events = await drain(session)
+    states = [e["payload"]["state"] for e in events if e["type"] == "session.state"]
+    assert states == ["starting", "buffering"]
+    await session.stop()
+
+
+async def test_mode_a_no_input_within_wait_fails_with_capture_start():
+    source = FakeLiveSource(tone(1.0), first_delay_s=60.0)
+    session = _mode_a_session(
+        source, session_id="modea5", timeline=TimelineConfig(input_wait_s=0.3)
+    )
+    await session.start()
+    await session.begin()
+    await asyncio.sleep(0.9)
+    events = await drain(session)
+    errors = [e["payload"] for e in events if e["type"] == "error"]
+    assert errors and errors[0]["code"] == "E_CAPTURE_START" and not errors[0]["recoverable"]
+    states = [e["payload"]["state"] for e in events if e["type"] == "session.state"]
+    assert states == ["starting", "stopped"]
+    assert source.stopped and session.stopped
+
+
+async def test_mode_a_stop_while_waiting_for_input_ends_promptly():
+    source = FakeLiveSource(tone(1.0), first_delay_s=60.0)
+    session = _mode_a_session(
+        source, session_id="modea6", timeline=TimelineConfig(input_wait_s=60.0)
+    )
+    await session.start()
+    await session.begin()
+    await asyncio.sleep(0.2)
+    t0 = time.time()
+    await session.stop()
+    assert time.time() - t0 < 2.0
+    events = await drain(session)
+    states = [e["payload"]["state"] for e in events if e["type"] == "session.state"]
+    assert states == ["starting", "stopped"]
+    assert not [e for e in events if e["type"] == "error"]
 
 
 @pytest.mark.parametrize("delay", [1.0])

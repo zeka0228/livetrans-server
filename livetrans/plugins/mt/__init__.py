@@ -130,6 +130,14 @@ class FallbackTranslator:
     async def health(self) -> bool:
         return bool(self.active) and await self.active[0].health()
 
+    async def list_models(self) -> list[dict]:
+        """체인에서 모델 목록을 줄 수 있는 첫 엔진(Ollama)의 설치 모델."""
+        for e in self.active:
+            fn = getattr(e, "list_models", None)
+            if fn is not None:
+                return await fn()
+        return []
+
     async def translate(
         self,
         text: str,

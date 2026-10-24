@@ -21,6 +21,7 @@ dependencies = [
     "pandas>=3.1.0",
     "pyannote-audio>=4.0,<5",
     "torchaudio>=2.9,<2.10",
+    "accelerate>=1.15.0",
 ]
 
 [dependency-groups]
