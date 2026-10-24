@@ -38,7 +38,7 @@ from livetrans.core.events import (
     error_payload,
     session_state_payload,
 )
-from livetrans.core.gpu import gpu_info, gpu_util
+from livetrans.core.gpu import gpu_info, gpu_util, release_cached_gpu_memory
 from livetrans.core.speaker import select_speakers, speaker_extent
 from livetrans.pipeline.lanes import LanePartial, LaneSegmenter, LaneUtterance
 from livetrans.pipeline.segmenter import PartialRequest, Segmenter, SpeechSegment
@@ -455,6 +455,7 @@ class Session:
         await self.source.stop()
         self._flush_fast = True  # 모드 A: 남은 세그먼트를 바로 흘려 보낸다
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        release_cached_gpu_memory()  # 세션 중 쌓인 VRAM 캐시 반환 (유휴 VRAM·커밋 감소)
         if self.hls is not None and self.mode == "A":
             loop = asyncio.get_running_loop()
             loop.call_later(120, lambda: getattr(self.hls, "inner", self.hls).remove())
@@ -473,6 +474,7 @@ class Session:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        release_cached_gpu_memory()
         self._discard_speakers()
         self.state = "stopped"
         self._close_logs()

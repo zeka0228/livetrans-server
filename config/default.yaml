@@ -37,6 +37,7 @@ diar:
                               #   scripts/download_models.py --diar  (토큰은 hf auth login 또는 HF_TOKEN)
   model: "pyannote/speaker-diarization-community-1"   # CC BY 4.0, THIRD_PARTY_NOTICES.md
   device: "cuda"
+  batch_size: 8               # 분할·임베딩 배치. 32 면 120 s 창에서 VRAM 캐시가 5 GB 까지 자람(속도 차이 없음, 2026-10-25 측정)
   max_speakers: 4             # 세션당 화자 상한
   max_speakers_per_seg: 2     # 구간당 동시 화자 상한 k. 화자마다 STT 1회 → segment.final 이 화자별로 1개씩
   match_threshold: 0.6        # 기존 화자로 볼 코사인 하한 (LDA 공간). 합성음 측정 2026-10-23: 같은 화자 0.79, 다른 화자 0.14~0.56 — 실방송으로 재조정
@@ -61,6 +62,7 @@ mt:                           # 번역 (명세 §4.4). 자막은 번역이 실�
   fallback: [passthrough]
   context_pairs: 3            # 화자별 직전 (원문, 번역) 쌍
   timeout_s: 6.0
+  use_mmap: true              # Ollama 러너가 모델 파일을 mmap 으로 열게. false 면 힙 복사로 RAM 이 +7 GB (2026-10-25 측정)
   glossary: config/glossary.yaml   # 용어집 (+ glossary.local.yaml). 형식: {"ja->ko": {용어: 번역}, "*->ko": {...}}
 
 timeline:                     # 모드 A 시간 모델 (명세 §3)

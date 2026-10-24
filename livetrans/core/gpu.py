@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
@@ -32,6 +33,68 @@ def prepare_cuda_dlls() -> list[Path]:
                 os.add_dll_directory(str(bin_dir))
                 added.append(bin_dir)
     return added
+
+
+def release_cached_gpu_memory() -> None:
+    """torch 캐싱 할당자가 쥔 VRAM 을 드라이버에 돌려준다 (세션 끝). 세션 중 쌓인 다양한 크기의 블록이 남아
+    유휴 때도 수 GB 가 예약된 채였고, Windows 는 이것을 프로세스 커밋(Private)에도 잡는다 (2026-10-25 측정)."""
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return
+    try:
+        if torch.cuda.is_available():
+            with GPU_LOCK:
+                torch.cuda.empty_cache()
+    except Exception as e:  # noqa: BLE001 — 정리 실패는 무시 (다음 세션에 영향 없음)
+        logging.getLogger("livetrans.gpu").debug("VRAM 캐시 반환 실패: %s", e)
+
+
+def process_memory_mb() -> dict[str, int] | None:
+    """이 프로세스의 RAM: rss(상주)·private(커밋). /api/health 에 실어 메모리 추적용. 못 재면 None."""
+    if sys.platform == "win32":
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [
+                ("cb", wt.DWORD),
+                ("PageFaultCount", wt.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            fn = k32.K32GetProcessMemoryInfo
+            fn.argtypes = [wt.HANDLE, ctypes.POINTER(_PMC), wt.DWORD]
+            fn.restype = wt.BOOL
+            k32.GetCurrentProcess.restype = wt.HANDLE
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(_PMC)
+            if not fn(k32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb):
+                return None
+            mb = 1024 * 1024
+            return {
+                "rss_mb": int(pmc.WorkingSetSize // mb),
+                "private_mb": int(pmc.PrivateUsage // mb),
+                "peak_rss_mb": int(pmc.PeakWorkingSetSize // mb),
+            }
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        import resource
+
+        peak_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return {"peak_rss_mb": int(peak_kb // 1024)}
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def gpu_util() -> float | None:
