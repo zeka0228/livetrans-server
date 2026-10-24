@@ -76,7 +76,8 @@ class FfmpegSource:
             self.record_path.parent.mkdir(parents=True, exist_ok=True)
             # flush_packets: raw.ts 를 패킷마다 디스크에 내려 HLS 쪽이 읽을 때 최신 상태가 되게 (기본은 256 KiB 단위라
             # 저비트레이트 방송에서 수 초 늦게 보임)
-            args += ["-map", "0", "-c", "copy", "-flush_packets", "1", "-f", "mpegts", str(self.record_path)]
+            args += ["-map", "0", "-c", "copy", "-flush_packets", "1"]
+            args += ["-f", "mpegts", str(self.record_path)]
         args += ["-map", "0:a:0", "-vn", "-ac", "2", "-ar", str(OUT_RATE), "-f", "s16le", "pipe:1"]
         try:
             self._proc = subprocess.Popen(  # noqa: ASYNC220
@@ -90,9 +91,11 @@ class FfmpegSource:
             raise RuntimeError(f"ffmpeg 를 실행할 수 없습니다 ({self.ffmpeg}): {e}") from e
         threading.Thread(target=self._read_stderr, daemon=True).start()
         threading.Thread(target=self._read_stdout, args=(loop,), daemon=True).start()
-        # 첫 오디오가 올 때까지(최대 15 s) 기다린다 — SRT listener 는 OBS 가 붙을 때까지 걸릴 수 있다
+        # 첫 오디오가 올 때까지 기다린다. 파일은 바로 온다. SRT/UDP listener 는 OBS 가 붙을 때까지 소리가 없으므로
+        # 포트 바인드 실패 같은 즉시 오류만 잡고(3 s) 돌아간다 — 그 뒤의 대기는 세션이 `timeline.input_wait_s` 로 관리한다
+        network = "://" in self.url
         try:
-            await asyncio.wait_for(self._started.wait(), 15.0)
+            await asyncio.wait_for(self._started.wait(), 3.0 if network else 15.0)
         except TimeoutError:
             if self._proc.poll() is not None:
                 raise RuntimeError(f"ffmpeg 가 입력을 열지 못했습니다: {self._tail()}") from None

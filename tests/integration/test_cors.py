@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-import pytest
 from fastapi.testclient import TestClient
 
 from livetrans.core.config import Settings, SttConfig
