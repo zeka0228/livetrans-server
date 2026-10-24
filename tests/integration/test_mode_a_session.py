@@ -367,3 +367,41 @@ async def test_mode_a_lookahead_does_not_wait_when_deadline_is_near():
     finals = [e["payload"] for e in events if e["type"] == "segment.final"]
     assert len(finals) >= 2
     assert mt.calls[0]["upcoming"] == []
+
+
+class EndingSource(FakeLiveSource):
+    """입력이 끝나면 lost_reason 을 두는 소스 — 정상 종료/끊김을 ended_normally 로 가른다 (S-23)."""
+
+    def __init__(self, audio, *, normal: bool) -> None:
+        super().__init__(audio)
+        self.ended_normally = normal
+
+    async def frames(self):
+        async for fr in super().frames():
+            yield fr
+        if not self.stopped:
+            self.lost_reason = (
+                "입력이 끝났습니다 (test)" if self.ended_normally else "입력이 끊겼습니다 (test)"
+            )
+
+
+@pytest.mark.parametrize("normal", [True, False])
+async def test_input_end_code_depends_on_whether_it_ended_normally(normal):
+    source = EndingSource(tone(1.2), normal=normal)
+    session = _mode_a_session(source, session_id=f"modea-end-{int(normal)}", delay=1.0)
+    await session.start()
+    await session.begin()
+    for _ in range(80):  # 입력 끝 → 세션이 스스로 stop 한다
+        await asyncio.sleep(0.1)
+        if session.stopped:
+            break
+    events = await drain(session)
+    errors = [e["payload"] for e in events if e["type"] == "error"]
+    states = [e["payload"]["state"] for e in events if e["type"] == "session.state"]
+    assert states[-1] == "stopped" and errors
+    if normal:
+        assert errors[-1]["code"] == "E_INPUT_ENDED" and errors[-1]["recoverable"] is True
+    else:
+        assert errors[-1]["code"] == "E_CAPTURE_LOST" and errors[-1]["recoverable"] is False
+    # 오류는 stopped 바로 앞 (남은 세그먼트 플러시 뒤)
+    assert events[-1]["type"] == "session.state" and events[-2]["type"] == "error"
