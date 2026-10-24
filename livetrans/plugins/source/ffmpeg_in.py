@@ -6,7 +6,8 @@
   t_cap 은 16 kHz 샘플 수로 센다 (I2). 48 kHz 쪽은 정확히 3배라 같은 축이다.
 - `record_video=True` 면 두 번째 ffmpeg 가 입력을 `raw.ts` 로 복사 기록한다 (HLS 쪽이 지연을 두고 뒤따라 읽는다).
   SRT 를 두 프로세스가 동시에 받을 수 없으므로 영상이 있을 땐 **한 프로세스**가 `-map` 으로 오디오 PCM(stdout)과 raw.ts(파일)를 같이 낸다.
-- 입력이 끝나거나 끊기면 `lost_reason` 을 두고 `frames()` 를 끝낸다 (세션은 E_CAPTURE_LOST → stopped).
+- 입력이 끝나거나 끊기면 `lost_reason` 을 두고 `frames()` 를 끝낸다. 파일 끝·스트림 정상 종료(ffmpeg rc 0, EOF, SRT 상대가 닫음)는
+  `ended_normally=True` → 세션이 HLS 플러시 뒤 `E_INPUT_ENDED`(recoverable) → stopped. 그 외(연결 실패 등)는 `E_CAPTURE_LOST` (S-23).
 """
 
 from __future__ import annotations
@@ -29,6 +30,23 @@ log = logging.getLogger("livetrans.source.ffmpeg")
 
 READ_BYTES = OUT_RATE * 2 * 2 // 10  # 100 ms of 48 kHz stereo PCM16
 OutputCallback = Callable[[np.ndarray, int], None]  # (stereo float32 [n,2], t_start_ms)
+
+
+NORMAL_END_MARKERS = ("end of file", "i/o error", "connection closed", "broken pipe", "eof")
+
+
+def classify_input_end(rc: int | None, stderr_tail: str, url: str) -> tuple[bool, str]:
+    """ffmpeg 입력이 끝났을 때 (정상 종료인지, 사용자에게 보일 사유).
+
+    정상: rc 0(파일 끝) 또는 stderr 가 EOF·I/O error·연결 닫힘(OBS 가 송출을 멈추면 SRT 는 "Error during demuxing: I/O error").
+    비정상: 그 외 (연결 거부·시간 초과·디코딩 실패 등) → 세션이 E_CAPTURE_LOST 로 보낸다.
+    """
+    tail = (stderr_tail or "").lower()
+    normal = rc == 0 or any(m in tail for m in NORMAL_END_MARKERS)
+    if normal:
+        return True, f"입력이 끝났습니다 ({url})"
+    detail = f": {stderr_tail}" if stderr_tail else (f" (rc={rc})" if rc is not None else "")
+    return False, f"입력이 끊겼습니다 ({url}){detail}"
 
 
 class FfmpegSource:
@@ -54,6 +72,9 @@ class FfmpegSource:
         self.clock = SampleClock(sample_rate)
         self.on_output = on_output
         self.lost_reason: str | None = None
+        self.ended_normally = (
+            False  # 입력이 정상적으로 끝났는지 (파일 끝·OBS 송출 중단). 세션이 오류 코드를 가른다
+        )
         self._queue: asyncio.Queue[AudioFrame | None] = asyncio.Queue()
         self._proc: subprocess.Popen | None = None
         self._stopping = False
@@ -134,7 +155,14 @@ class FfmpegSource:
                 )
         finally:
             if not self._stopping:
-                self.lost_reason = f"입력이 끝나거나 끊겼습니다 ({self.url}){': ' + self._tail() if self._stderr else ''}"
+                rc = None
+                try:
+                    rc = self._proc.wait(timeout=2.0) if self._proc else None
+                except Exception:  # noqa: BLE001 — 종료 코드를 못 얻으면 stderr 로만 판단
+                    rc = None
+                self.ended_normally, self.lost_reason = classify_input_end(
+                    rc, self._tail(), self.url
+                )
             loop.call_soon_threadsafe(self._deliver, None)
 
     def _deliver(self, frame: AudioFrame | None) -> None:

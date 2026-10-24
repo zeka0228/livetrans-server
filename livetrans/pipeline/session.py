@@ -566,8 +566,12 @@ class Session:
             loop.call_later(120, lambda: getattr(self.hls, "inner", self.hls).remove())
         lost = getattr(self.source, "lost_reason", None)
         if lost:
-            # 남은 final 을 전부 보낸 뒤, stopped 바로 앞에 보낸다 (앱은 이 오류를 받으면 바로 세션을 끝낸다)
-            self._emit("error", error_payload("E_CAPTURE_LOST", lost, False))
+            # 남은 final·번역·HLS 플러시가 끝난 뒤, stopped 바로 앞에 보낸다. 정상 종료(파일 끝·OBS 송출 중단)는
+            # E_INPUT_ENDED(recoverable) — 앱은 플레이어를 유지해 남은 D 초를 끝까지 재생한다 (API 계약 S-23/S-31)
+            if getattr(self.source, "ended_normally", False):
+                self._emit("error", error_payload("E_INPUT_ENDED", lost, True))
+            else:
+                self._emit("error", error_payload("E_CAPTURE_LOST", lost, False))
         self._discard_speakers()
         self._emit_state("stopped")
         self._close_logs()

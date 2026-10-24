@@ -85,7 +85,7 @@ def test_mode_a_file_source_serves_hls(tmp_path: Path):
             seg = client.get(f"/hls/{sid}/{seg_name}")
             assert seg.status_code == 200 and seg.headers["content-type"].startswith("video/mp2t")
             assert client.get(f"/hls/{sid}/../etc").status_code in (404, 422)
-            # 파일 끝 → 서버가 세션을 끝낸다 (E_CAPTURE_LOST 뒤 stopped)
+            # 파일 끝 → 서버가 세션을 끝낸다 (HLS 플러시 뒤 E_INPUT_ENDED(recoverable) → stopped, S-23)
             while True:
                 ev = json.loads(ws.receive_text())
                 events.append(ev)
@@ -93,6 +93,11 @@ def test_mode_a_file_source_serves_hls(tmp_path: Path):
                     break
     states = [e["payload"]["state"] for e in events if e["type"] == "session.state"]
     assert states[:3] == ["starting", "buffering", "playing"] and states[-1] == "stopped"
+    errors = [e["payload"] for e in events if e["type"] == "error"]
+    assert errors and errors[-1]["code"] == "E_INPUT_ENDED" and errors[-1]["recoverable"] is True
+    assert (
+        events.index(next(e for e in events if e["type"] == "error")) < len(events) - 1
+    )  # stopped 바로 앞
     assert [e for e in events if e["type"] == "segment.final"]
     assert [e for e in events if e["type"] == "translation.final"]
     assert [e for e in events if e["type"] == "tts.ready"]
