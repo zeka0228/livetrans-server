@@ -24,5 +24,5 @@ async def hls_file(session_id: str, name: str, request: Request) -> FileResponse
     return FileResponse(
         path,
         media_type=media_type,
-        headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"},
+        headers={"Cache-Control": "no-store"},  # CORS 헤더는 CORSMiddleware 가 붙인다 (server.cors_origins)
     )

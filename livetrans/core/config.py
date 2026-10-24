@@ -18,6 +18,10 @@ ENV_CONFIG_DIR = "LIVETRANS_CONFIG_DIR"
 class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8765
+    # 브라우저 앱(Flutter 웹)이 REST·HLS 를 부를 수 있게 허용할 출처. 빈 목록이면 CORS 미들웨어를 켜지 않는다.
+    cors_origins: list[str] = Field(
+        default_factory=lambda: ["http://127.0.0.1:8780", "http://localhost:8780"]
+    )
 
 
 class AudioConfig(BaseModel):

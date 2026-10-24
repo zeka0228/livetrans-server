@@ -20,6 +20,8 @@ scripts\run_server.bat
 
 기본 주소는 `http://127.0.0.1:8765` 이며 `GET /api/health` 로 상태를 확인합니다. 개인 설정은 `config/default.local.yaml` 에 두면 `config/default.yaml` 위에 덮어써집니다 (gitignore).
 
+브라우저 앱(Flutter 웹)이 REST(`/api/*`)·HLS(`/hls/*`) 를 부를 수 있도록 `server.cors_origins`(기본 `http://127.0.0.1:8780`, `http://localhost:8780`) 출처에 CORS 를 허용합니다. 앱을 다른 포트에서 띄우면 `config/default.local.yaml` 의 `server.cors_origins` 에 추가하고, 빈 목록이면 CORS 를 끕니다. WebSocket 은 CORS 대상이 아닙니다.
+
 ### 모델 내려받기
 
 STT 모델 가중치는 저장소에 없고 첫 실행 전에 받아야 합니다 (받지 않으면 서버 기동 시 Hugging Face 에서 자동으로 받느라 오래 걸립니다).
