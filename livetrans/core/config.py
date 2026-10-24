@@ -178,8 +178,20 @@ class LoggingConfig(BaseModel):
     )
 
 
+class RouteConfig(BaseModel):
+    """모드 A 원본 소리 격리 (명세 §4.9 Output Router, D-023). 사용자는 지연 출력만 듣고 원본 앱 소리는 격리 장치로만 나간다."""
+
+    router: str = "spare_device"  # spare_device(안 쓰는 실제 출력 장치) | virtual_cable | none(격리 안 함·점검 생략)
+    check_ms: int = 1500  # route/check 에서 피크 레벨을 재는 시간
+    signal_threshold: float = (
+        0.01  # 격리 장치 피크가 이 미만이면 "소리 없음" (원본이 격리 장치로 안 나감)
+    )
+    leak_threshold: float = 0.02  # 사용자 기본 출력 장치 피크가 이 이상이면 "새고 있음"
+
+
 class Settings(BaseModel):
     server: ServerConfig = ServerConfig()
+    route: RouteConfig = RouteConfig()
     audio: AudioConfig = AudioConfig()
     vad: VadConfig = VadConfig()
     stt: SttConfig = SttConfig()

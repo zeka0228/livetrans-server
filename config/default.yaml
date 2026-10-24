@@ -75,6 +75,11 @@ mt:                           # 번역 (명세 §4.4). 자막은 번역이 실�
   use_mmap: true              # Ollama 러너가 모델 파일을 mmap 으로 열게. false 면 힙 복사로 RAM 이 +7 GB (2026-10-25 측정)
   glossary: config/glossary.yaml   # 용어집 (+ glossary.local.yaml). 형식: {"ja->ko": {용어: 번역}, "*->ko": {...}}
 
+route:                        # 모드 A 원본 소리 격리 (명세 §4.9, D-023). 사용자는 지연 출력만 듣는다
+  router: spare_device        # spare_device = 안 쓰는 실제 출력 장치(예: 모니터 HDMI)를 격리 장치로 | none = 격리 안 함 (테스트·개발)
+  check_ms: 1500              # POST /api/audio/route/check 가 피크 레벨을 재는 시간
+  signal_threshold: 0.01      # 격리 장치 피크 하한 (미만이면 원본이 거기로 안 나가는 것)
+  leak_threshold: 0.02        # 사용자 출력 장치 피크 상한 (이상이면 원본이 스피커로 새는 것)
 timeline:                     # 모드 A 시간 모델 (명세 §3)
   segment_s: 1.0
   holdback_s: 3.0             # H

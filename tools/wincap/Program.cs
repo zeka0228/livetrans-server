@@ -2,6 +2,9 @@
 //   wincap list                 보이는 최상위 창 목록을 JSON 으로 stdout 에 출력
 //   wincap capture system       기본 출력 장치 소리 전체 (WASAPI loopback)
 //   wincap capture pid <PID>    해당 프로세스 트리의 소리만 (Windows 10 2004+ process loopback)
+//   wincap capture device <ID>  특정 출력(렌더) 장치의 소리 (WASAPI loopback) — 모드 A 격리 장치 캡처 (명세 §4.9)
+//   wincap devices              출력 장치 목록 JSON [{id, name, state, is_default}]
+//   wincap meter <ms> <ID>...   ms 동안 장치별 피크 레벨 JSON {id: {peak, mean}} — 격리 점검용
 // capture 는 16 kHz mono PCM16 LE 를 stdout 으로 계속 내보낸다. stdin 이 닫히면 종료.
 // 소리가 안 나는 동안 WASAPI 가 패킷을 안 주므로, 벽시계 기준으로 모자란 만큼 무음을 채워 시간축(t_cap)을 유지한다.
 using System.Diagnostics;
@@ -22,6 +25,18 @@ if (args.Length >= 1 && args[0] == "list")
     Console.WriteLine(JsonSerializer.Serialize(Windows.List()));
     return 0;
 }
+if (args.Length >= 1 && args[0] == "devices")
+{
+    Console.OutputEncoding = new UTF8Encoding(false);
+    Console.WriteLine(JsonSerializer.Serialize(Devices.List()));
+    return 0;
+}
+if (args.Length >= 3 && args[0] == "meter" && int.TryParse(args[1], out var meterMs))
+{
+    Console.OutputEncoding = new UTF8Encoding(false);
+    Console.WriteLine(JsonSerializer.Serialize(Devices.Meter(args.Skip(2).ToArray(), meterMs)));
+    return 0;
+}
 if (args.Length >= 2 && args[0] == "capture")
 {
     try
@@ -32,6 +47,15 @@ if (args.Length >= 2 && args[0] == "capture")
         {
             capture = new WasapiLoopbackCapture();
         }
+        else if (args[1] == "device" && args.Length >= 3)
+        {
+            using var en = new MMDeviceEnumerator();
+            MMDevice dev;
+            try { dev = en.GetDevice(args[2]); }
+            catch (Exception) { Console.Error.WriteLine($"ERROR device not found: {args[2]}"); return 4; }
+            if (dev.State != DeviceState.Active) { Console.Error.WriteLine($"ERROR device not active: {dev.FriendlyName} ({dev.State})"); return 4; }
+            capture = new WasapiLoopbackCapture(dev);
+        }
         else if (args[1] == "pid" && args.Length >= 3 && int.TryParse(args[2], out var pid))
         {
             // process loopback 은 없는 PID 로도 활성화에 성공하므로 직접 확인한다
@@ -41,7 +65,7 @@ if (args.Length >= 2 && args[0] == "capture")
         }
         else
         {
-            throw new ArgumentException("usage: capture system | capture pid <PID>");
+            throw new ArgumentException("usage: capture system | capture pid <PID> | capture device <ID>");
         }
         return Run(capture, target);
     }
@@ -51,7 +75,7 @@ if (args.Length >= 2 && args[0] == "capture")
         return 2;
     }
 }
-Console.Error.WriteLine("usage: wincap list | wincap capture system | wincap capture pid <PID>");
+Console.Error.WriteLine("usage: wincap list | wincap devices | wincap meter <ms> <ID>... | wincap capture system | wincap capture pid <PID> | wincap capture device <ID>");
 return 1;
 
 static int Run(IWaveIn capture, Process? target)
@@ -310,5 +334,64 @@ sealed class ProcessLoopbackCapture : IWaveIn
             if (hr < 0) Result.TrySetException(Marshal.GetExceptionForHR(hr)!);
             else Result.TrySetResult(iface);
         }
+    }
+}
+
+static class Devices
+{
+    public record Entry(string id, string name, string state, bool is_default);
+    public record Level(double peak, double mean);
+
+    static string StateName(DeviceState s) => s switch
+    {
+        DeviceState.Active => "active",
+        DeviceState.Disabled => "disabled",
+        DeviceState.Unplugged => "unplugged",
+        DeviceState.NotPresent => "notpresent",
+        _ => s.ToString().ToLowerInvariant(),
+    };
+
+    public static List<Entry> List()
+    {
+        using var en = new MMDeviceEnumerator();
+        string? def = null;
+        try { def = en.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console).ID; } catch (Exception) { }
+        var result = new List<Entry>();
+        foreach (var d in en.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active | DeviceState.Unplugged | DeviceState.Disabled))
+        {
+            string name;
+            try { name = d.FriendlyName; } catch (Exception) { name = d.ID; }
+            result.Add(new Entry(d.ID, name, StateName(d.State), d.ID == def));
+        }
+        return result;
+    }
+
+    // 장치별 마스터 피크 미터를 50 ms 마다 읽어 최대·평균을 돌려준다. 장치가 없거나 비활성이면 peak = -1
+    public static Dictionary<string, Level> Meter(string[] ids, int ms)
+    {
+        using var en = new MMDeviceEnumerator();
+        var devs = new Dictionary<string, MMDevice>();
+        var peaks = new Dictionary<string, List<double>>();
+        foreach (var id in ids.Distinct())
+        {
+            try { var d = en.GetDevice(id); if (d.State == DeviceState.Active) { devs[id] = d; peaks[id] = new(); } }
+            catch (Exception) { }
+        }
+        var sw = Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < ms)
+        {
+            foreach (var (id, d) in devs)
+            {
+                try { peaks[id].Add(d.AudioMeterInformation.MasterPeakValue); } catch (Exception) { }
+            }
+            Thread.Sleep(50);
+        }
+        var result = new Dictionary<string, Level>();
+        foreach (var id in ids.Distinct())
+        {
+            if (!peaks.TryGetValue(id, out var list) || list.Count == 0) { result[id] = new Level(-1, -1); continue; }
+            result[id] = new Level(list.Max(), list.Average());
+        }
+        return result;
     }
 }
