@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
 
-from livetrans.core.gpu import gpu_info, gpu_util
+from livetrans.core.gpu import gpu_info, gpu_util, process_memory_mb
 
 router = APIRouter(prefix="/api")
 
@@ -77,4 +77,10 @@ async def engines(request: Request) -> dict:
 @router.get("/health")
 async def health(request: Request) -> dict:
     loaded = list(getattr(request.app.state, "models_loaded", []))
-    return {"status": "ok", "gpu": gpu_info(), "models_loaded": loaded}
+    # process: 서버 프로세스 RAM (rss_mb 상주, private_mb 커밋). 메모리 추적용 (2026-10-25)
+    return {
+        "status": "ok",
+        "gpu": gpu_info(),
+        "process": process_memory_mb(),
+        "models_loaded": loaded,
+    }

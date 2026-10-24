@@ -92,10 +92,22 @@ class DiCoWSTT:
         t0 = time.perf_counter()
         self._device = torch.device(self.cfg.device)
         self._dtype = torch.float16 if "float16" in self.cfg.compute_type else torch.float32
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            self.model_id, trust_remote_code=True, torch_dtype=self._dtype
-        )
-        model = model.to(self._device).eval()
+        # 가중치를 GPU 로 바로 올린다 (device_map, accelerate 필요). CPU 에 올렸다 옮기면 fp16 3 GB 만큼 힙이 남아
+        # RSS +1.3 GB·커밋 +1.6 GB·피크 +1.5 GB (2026-10-25 측정). accelerate 가 없으면 예전 경로.
+        try:
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                self.model_id,
+                trust_remote_code=True,
+                torch_dtype=self._dtype,
+                device_map=str(self._device),
+                low_cpu_mem_usage=True,
+            ).eval()
+        except (ImportError, ValueError) as e:
+            log.warning("DiCoW GPU 직접 로드 실패(%s) → CPU 경유 로드", e)
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                self.model_id, trust_remote_code=True, torch_dtype=self._dtype
+            )
+            model = model.to(self._device).eval()
         tok = AutoTokenizer.from_pretrained(self.model_id)
         _lower_uppercase_mapping(tok)
         model.set_tokenizer(tok)

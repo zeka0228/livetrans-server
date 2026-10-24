@@ -68,6 +68,7 @@ async def test_ollama_translate_posts_chat_with_json_format():
     assert body["messages"][-1] == {"role": "user", "content": "今日はいい天気"}
     assert body["options"]["temperature"] == 0.1
     assert body["think"] is False  # 추론 모델 사고 출력 끔 (벤치 2026-10-25)
+    assert body["options"]["use_mmap"] is True  # Ollama 러너 mmap 로딩 (RAM −7 GB, 2026-10-25)
 
 
 async def test_ollama_retries_once_on_bad_json_then_raises():

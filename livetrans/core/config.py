@@ -34,6 +34,10 @@ class VadConfig(BaseModel):
     min_silence_ms: int = 600
     speech_pad_ms: int = 200
     max_utterance_s: float = 8.0
+    # 화자 레인(D-028) 경계 조각: 이보다 짧게 말한 발화는 바로 내보내지 않고 같은 화자의 다음 발화(틈 ≤ lane_merge_gap_ms)에
+    # 붙인다. 다음 발화가 없으면 버린다. 2026-10-25: 0.4 s 조각("sigum")이 그대로 번역·TTS 까지 가던 문제
+    lane_min_speech_ms: int = 400
+    lane_merge_gap_ms: int = 1500
 
 
 class SttConfig(BaseModel):
@@ -68,6 +72,9 @@ class DiarConfig(BaseModel):
     right_context_s: float = 2.0  # stream: 확정을 미루는 오른쪽 문맥 (C_diar)
     model: str = "pyannote/speaker-diarization-community-1"
     device: str = "cuda"
+    # 분할·임베딩 추론 배치. 2026-10-25 측정(120 s 창): 32 → 창당 피크 1.6 GB, 스트림 40 step 뒤 캐시 5.1 GB 예약;
+    # 8 → 피크 0.46 GB, 예약 0.8 GB, 속도 동일. VRAM 예약은 Windows 에서 프로세스 커밋(Private)에도 잡힌다
+    batch_size: int = 8
     max_speakers: int = 4  # 세션당 화자 상한
     max_speakers_per_seg: int = 2  # 구간당 동시 화자 상한 k (명세 Q11)
     match_threshold: float = 0.6  # 기존 화자로 볼 코사인 하한 (pyannote LDA 공간). 합성음 측정 2026-10-23: 같은 화자 0.79, 다른 화자 0.14~0.56
@@ -93,6 +100,9 @@ class TimelineConfig(BaseModel):
     guard_s: float = 1.0  # G
     default_delay_s: int = 36  # D 기본 (D-022 최악 가정). 테스트는 요청에서 작게
     ring_extra_s: float = 30.0  # 원본 출력 링버퍼 여유
+    # control start 뒤 첫 입력 소리가 이 시간 안에 안 오면 E_CAPTURE_START 로 끝낸다. SRT listener 는 OBS 가 붙을 때까지
+    # 소리가 없으므로, 타임라인(D)은 첫 소리가 도착한 순간부터 센다 (ERR-011)
+    input_wait_s: float = 90.0
     max_lag_s: float = (
         8.0  # 결과가 이보다 늦으면 버림 (L3). L_max(8 s) 발화가 D 부족 시에도 버려지지 않게
     )
@@ -139,6 +149,9 @@ class MtConfig(BaseModel):
     # 추론(thinking) 모델의 사고 출력 끄기. 2026-10-25 벤치: qwen3:14b·gemma4 는 켜진 채로는 사고에 토큰을 다 써 40문장 중
     # 35~39개가 빈 출력(7 s), 끄면 0.3 s 에 정상 출력. 비추론 모델(gemma2 등)에는 영향 없음
     think: bool = False
+    # 러너가 모델 파일을 mmap 으로 열게 (Ollama 0.40 Windows 는 기본 `--load-mode none` 으로 6.3 GB 를 힙에 복사해
+    # 100 % GPU 인데도 RAM 12~16 GB 를 잡았다. 2026-10-25 측정: mmap 이면 WS 12.3 → 5.5 GB, 페이지 캐시라 회수 가능)
+    use_mmap: bool = True
 
 
 class LoggingConfig(BaseModel):

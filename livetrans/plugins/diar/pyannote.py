@@ -77,6 +77,10 @@ class PyannoteDiarizerEngine:
                     "(HF 이용 조건 동의 + 토큰 후 scripts/download_models.py --diar)"
                 )
             pipe.to(torch.device(self.cfg.device))
+            # 배치를 줄여 창당 피크 VRAM 과 캐시 예약을 낮춘다 (DiarConfig.batch_size 측정 주석 참고)
+            for attr in ("segmentation_batch_size", "embedding_batch_size"):
+                if hasattr(pipe, attr):
+                    setattr(pipe, attr, self.cfg.batch_size)
             plda = getattr(pipe, "_plda", None)
             self._transform = getattr(plda, "_xvec_tf", None)
             # 첫 호출이 느리므로(약 1 s) 잡음 1 s 로 워밍업

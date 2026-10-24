@@ -218,7 +218,12 @@ class OllamaTranslator:
             "format": "json",
             "keep_alive": self.cfg.keep_alive,
             "think": self.cfg.think,  # 추론 모델의 사고 출력 (MtConfig.think). 비추론 모델은 무시한다
-            "options": {"temperature": self.cfg.temperature, "num_predict": self.cfg.max_tokens},
+            "options": {
+                "temperature": self.cfg.temperature,
+                "num_predict": self.cfg.max_tokens,
+                # 러너 로딩 방식 (MtConfig.use_mmap). 모델을 처음 올리는 요청에만 영향, 이후 요청은 무시된다
+                "use_mmap": self.cfg.use_mmap,
+            },
         }
         try:
             r = await self._client.post("/api/chat", json=body, timeout=self.cfg.timeout_s)

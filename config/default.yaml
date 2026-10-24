@@ -15,6 +15,8 @@ vad:
   min_silence_ms: 600
   speech_pad_ms: 200
   max_utterance_s: 8.0
+  lane_min_speech_ms: 400     # 화자 레인 경계 조각: 이보다 짧은 발화는 다음 발화(틈 ≤ lane_merge_gap_ms)에 붙이고, 없으면 버림 (2026-10-25)
+  lane_merge_gap_ms: 1500
 stt:
   engine: dicow               # dicow | faster_whisper | fake  (D-019: 화자 조건부 Whisper, 로드 실패 시 fallback)
   model: "BUT-FIT/DiCoW_v3_3" # dicow 가중치 (CC BY 4.0, THIRD_PARTY_NOTICES.md). 미리 받기: scripts/download_models.py
@@ -38,6 +40,7 @@ diar:
                               #   scripts/download_models.py --diar  (토큰은 hf auth login 또는 HF_TOKEN)
   model: "pyannote/speaker-diarization-community-1"   # CC BY 4.0, THIRD_PARTY_NOTICES.md
   device: "cuda"
+  batch_size: 8               # 분할·임베딩 배치. 32 면 120 s 창에서 VRAM 캐시가 5 GB 까지 자람(속도 차이 없음, 2026-10-25 측정)
   max_speakers: 4             # 세션당 화자 상한
   max_speakers_per_seg: 2     # 구간당 동시 화자 상한 k. 화자마다 STT 1회 → segment.final 이 화자별로 1개씩
   match_threshold: 0.6        # 기존 화자로 볼 코사인 하한 (LDA 공간). 합성음 측정 2026-10-23: 같은 화자 0.79, 다른 화자 0.14~0.56 — 실방송으로 재조정
@@ -63,6 +66,7 @@ mt:                           # 번역 (명세 §4.4). 자막은 번역이 실�
   context_pairs: 3            # 화자별 직전 (원문, 번역) 쌍
   timeout_s: 6.0
   think: false                # 추론 모델(qwen3·gemma4)의 사고 출력 끔 — 켜 두면 토큰을 다 써 빈 출력 (벤치 2026-10-25)
+  use_mmap: true              # Ollama 러너가 모델 파일을 mmap 으로 열게. false 면 힙 복사로 RAM 이 +7 GB (2026-10-25 측정)
   glossary: config/glossary.yaml   # 용어집 (+ glossary.local.yaml). 형식: {"ja->ko": {용어: 번역}, "*->ko": {...}}
 
 timeline:                     # 모드 A 시간 모델 (명세 §3)
@@ -71,6 +75,7 @@ timeline:                     # 모드 A 시간 모델 (명세 §3)
   guard_s: 1.0                # G
   default_delay_s: 36         # D 기본값 (요청 delay_s 가 null 일 때). 테스트는 요청에서 10~15 로
   max_lag_s: 8.0              # 자막·TTS 가 이보다 늦으면 버림 (L3). D 가 충분하면 생기지 않는다
+  input_wait_s: 90.0          # start 뒤 첫 입력(OBS 접속 등)을 기다리는 최대 시간. D 는 첫 소리부터 센다
 tools:
   ffmpeg: null                # null = PATH → ~/Downloads/ffmpeg*/bin 자동 탐색. 다른 위치면 경로 지정
 output:
