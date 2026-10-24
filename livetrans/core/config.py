@@ -68,6 +68,9 @@ class DiarConfig(BaseModel):
     right_context_s: float = 2.0  # stream: 확정을 미루는 오른쪽 문맥 (C_diar)
     model: str = "pyannote/speaker-diarization-community-1"
     device: str = "cuda"
+    # 분할·임베딩 추론 배치. 2026-10-25 측정(120 s 창): 32 → 창당 피크 1.6 GB, 스트림 40 step 뒤 캐시 5.1 GB 예약;
+    # 8 → 피크 0.46 GB, 예약 0.8 GB, 속도 동일. VRAM 예약은 Windows 에서 프로세스 커밋(Private)에도 잡힌다
+    batch_size: int = 8
     max_speakers: int = 4  # 세션당 화자 상한
     max_speakers_per_seg: int = 2  # 구간당 동시 화자 상한 k (명세 Q11)
     match_threshold: float = 0.6  # 기존 화자로 볼 코사인 하한 (pyannote LDA 공간). 합성음 측정 2026-10-23: 같은 화자 0.79, 다른 화자 0.14~0.56
@@ -137,6 +140,9 @@ class MtConfig(BaseModel):
     temperature: float = 0.1
     max_tokens: int = 200
     glossary: str | None = "config/glossary.yaml"  # + glossary.local.yaml (gitignore)
+    # 러너가 모델 파일을 mmap 으로 열게 (Ollama 0.40 Windows 는 기본 `--load-mode none` 으로 6.3 GB 를 힙에 복사해
+    # 100 % GPU 인데도 RAM 12~16 GB 를 잡았다. 2026-10-25 측정: mmap 이면 WS 12.3 → 5.5 GB, 페이지 캐시라 회수 가능)
+    use_mmap: bool = True
 
 
 class LoggingConfig(BaseModel):

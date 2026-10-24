@@ -43,6 +43,19 @@ uv run python scripts\download_models.py --all      # + kotoba-whisper(일본어
 uv run pytest
 ```
 
+## 메모리·자원 (2026-10-25 측정, RTX 4070 Ti SUPER 16 GB · Windows 11)
+
+서버 프로세스의 RAM 은 대부분 **모델이 아니라 CUDA 라이브러리 DLL 코드 페이지**(torch_cuda·cuBLAS·cuDNN 등 ≈ 3~4 GB, Windows 가 DLL 을 재배치하면서 프로세스 전용 페이지가 됨)이고, 작업 관리자의 "커밋"(Private)에는 **VRAM 예약분까지 잡힙니다**(WDDM). 번역 LLM 은 Ollama 별도 프로세스입니다.
+
+| 항목 | RAM 상주(WS) | VRAM | 줄이는 방법 |
+|---|---|---|---|
+| 서버 로드 직후 (DiCoW + 구조 STT + pyannote + TTS) | ≈ 2.9 GB | ≈ 6.9 GB | `stt.rescue: null` 이면 VRAM −3.7 GB·커밋 −3.8 GB (환각 복구 없음) |
+| 첫 세션 뒤 (커널 코드 페이지인·캐시) | ≈ 3.5~4 GB | +1~2 GB | 세션 끝에 VRAM 캐시 반환(기본) |
+| Ollama gemma2:9b 러너 | 5.5 GB (mmap, 회수 가능) | 6.3 GB | `mt.use_mmap: true`(기본). false 면 RAM 12 GB |
+| 화자 분할 스트림 120 s 창 | — | 배치 8: 0.5~0.8 GB | `diar.batch_size` (32 면 5 GB 까지 자람) |
+
+`GET /api/health` 의 `process.rss_mb / private_mb` 로 추적할 수 있습니다. 가장 가벼운 구성은 `diar.engine: none` + `stt.rescue: null` (RAM ≈ 2.4 GB, VRAM ≈ 3 GB + Ollama).
+
 ## Rights & Responsible Use
 
 - 이 프로젝트는 개인 시청 보조 도구입니다. 번역 결과물을 업로드·재배포하는 기능은 제공하지 않습니다.
