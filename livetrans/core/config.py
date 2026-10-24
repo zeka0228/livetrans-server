@@ -51,6 +51,10 @@ class SttConfig(BaseModel):
         None  # 환각 판정 시 그 발화만 다시 인식할 구조 엔진 (기본 엔진과 함께 로드, VRAM 추가)
     )
     rescue_model: str = "large-v3"
+    # 언어별 라우팅 (세션 요청 stt.engine 이 "auto" 일 때): 지정/감지 언어 → 엔진 이름. 그 엔진이 기본 또는 구조 엔진으로
+    # 떠 있을 때만 적용된다. 2026-10-25 벤치: 한국어는 DiCoW 가 CER 0.011 vs fw 0.046 에 2배 빠르고 화자 마스크도 되어 유지,
+    # 일본어는 DiCoW 가 언어를 en 으로 오판(5건 중 3건 → 번역 src 가 틀어짐)해 fw 로. 일본어 방송은 src_lang=ja 지정 권장
+    route_by_lang: dict[str, str] = Field(default_factory=lambda: {"ja": "faster_whisper"})
     device: str = "cuda"
     compute_type: str = "float16"
     beam_final: int = 5
@@ -131,7 +135,9 @@ class MtConfig(BaseModel):
     """번역 (명세 §4.4). 기본 Ollama 로컬 LLM, 실패하면 체인 → 마지막은 항상 원문(passthrough)."""
 
     engine: str = "passthrough"  # ollama_llm | passthrough. 모델 기본값은 passthrough(테스트가 네트워크를 안 타게), 저장소 default.yaml 이 ollama_llm 으로 켠다
-    model: str = "gemma2:9b"  # 2026-10-23 측정: 190~440 ms/문장(서버와 함께 100 % GPU, 6.3 GB), 한국어 자연스러움. qwen2.5:7b 는 한국어 출력 중 중국어로 샘
+    # 2026-10-25 벤치(40문장 chrF, 서버와 동시 100 % GPU): gemma4:e4b ja 56 / en 43, 0.2 s, VRAM 3.3 GB > gemma3:12b-it-qat 41/34, 1.0 s,
+    # 8.8 GB > gemma2:9b 39/24, 0.3 s, 6.3 GB. qwen2.5:7b 는 한국어 출력에 중국어가 샘. 추론 모델은 think=false 필수
+    model: str = "gemma4:e4b"
     url: str = "http://127.0.0.1:11434"
     fallback: list[str] = Field(default_factory=lambda: ["passthrough"])
     context_pairs: int = 3  # 화자별 직전 (원문, 번역) 쌍 수
@@ -140,6 +146,9 @@ class MtConfig(BaseModel):
     temperature: float = 0.1
     max_tokens: int = 200
     glossary: str | None = "config/glossary.yaml"  # + glossary.local.yaml (gitignore)
+    # 추론(thinking) 모델의 사고 출력 끄기. 2026-10-25 벤치: qwen3:14b·gemma4 는 켜진 채로는 사고에 토큰을 다 써 40문장 중
+    # 35~39개가 빈 출력(7 s), 끄면 0.3 s 에 정상 출력. 비추론 모델(gemma2 등)에는 영향 없음
+    think: bool = False
     # 러너가 모델 파일을 mmap 으로 열게 (Ollama 0.40 Windows 는 기본 `--load-mode none` 으로 6.3 GB 를 힙에 복사해
     # 100 % GPU 인데도 RAM 12~16 GB 를 잡았다. 2026-10-25 측정: mmap 이면 WS 12.3 → 5.5 GB, 페이지 캐시라 회수 가능)
     use_mmap: bool = True

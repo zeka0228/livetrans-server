@@ -45,6 +45,16 @@ class DisplaySpec(BaseModel):
     show_speaker: bool = True
 
 
+class SttSpec(BaseModel):
+    # auto(언어별 라우팅) | GET /api/engines 의 stt.engines[].name (API 계약 S-26)
+    engine: str = "auto"
+
+
+class MtSpec(BaseModel):
+    # null = 서버 기본. GET /api/engines 의 mt.models[].name (Ollama 설치 모델)
+    model: str | None = None
+
+
 class SessionCreate(BaseModel):
     mode: str
     source: SourceSpec
@@ -53,6 +63,8 @@ class SessionCreate(BaseModel):
     delay_s: int | None = None
     tts: TtsSpec = TtsSpec()
     display: DisplaySpec = DisplaySpec()
+    stt: SttSpec = SttSpec()
+    mt: MtSpec = MtSpec()
 
 
 def _error(status: int, code: str, message: str) -> HTTPException:
@@ -97,6 +109,17 @@ async def create_session(body: SessionCreate, request: Request) -> dict:
             f"mode={body.mode}, source={body.source.type} 는 아직 지원하지 않습니다"
             " (현재: mode C + mic_ws, mode B + loopback, mode A + obs_stream|file|loopback)",
         )
+    rescue = getattr(app.state, "stt_rescue", None)
+    loaded = {e.name for e in (app.state.stt, rescue) if e is not None}
+    if body.stt.engine != "auto" and body.stt.engine not in loaded:
+        raise _error(
+            400,
+            "E_STT_ENGINE",
+            f"STT 엔진 {body.stt.engine!r} 는 떠 있지 않습니다 (가능: auto, {', '.join(sorted(loaded))})",
+        )
+    translator = getattr(app.state, "mt", None)
+    if body.mt.model and translator is not None and body.mt.model != translator.model_id:
+        translator = await _session_translator(app, body.mt.model)
     session = Session(
         app.state.settings,
         app.state.stt,
@@ -106,8 +129,9 @@ async def create_session(body: SessionCreate, request: Request) -> dict:
         src_lang=None if body.src_lang in (None, "auto") else body.src_lang,
         tgt_lang=body.tgt_lang,
         session_id=session_id,
-        rescue_stt=getattr(app.state, "stt_rescue", None),
-        translator=getattr(app.state, "mt", None),
+        rescue_stt=rescue,
+        translator=translator,
+        stt_engine=body.stt.engine,
         **_diarizer_kwargs(app),
         **extra,
     )
@@ -176,6 +200,26 @@ async def _mode_a_setup(app, body: SessionCreate, session_id: str, sample_rate: 
         "tts_voice_ref": body.tts.voice_ref,
         "show_speaker": body.display.show_speaker,
     }
+
+
+async def _session_translator(app, model: str):
+    """세션 전용 번역 체인 (요청 `mt.model`, API 계약 S-26). Ollama 가 모델을 올리므로 첫 세션은 수 초 걸릴 수 있다."""
+    from livetrans.plugins.mt import create_translator
+    from livetrans.plugins.mt.base import TranslationError
+
+    cfg = app.state.settings.mt.model_copy(update={"model": model})
+    tr = create_translator(cfg)
+    try:
+        await tr.load()
+    except TranslationError as e:
+        raise _error(400, "E_MT_MODEL", f"번역 모델 {model!r} 을 쓸 수 없습니다: {e}") from e
+    if tr.name == "passthrough":  # 체인이 Ollama 를 빼고 원문 통과만 남음 (모델 없음 등)
+        await tr.close()
+        raise _error(
+            400, "E_MT_MODEL", f"번역 모델 {model!r} 을 쓸 수 없습니다 (Ollama 에 없거나 연결 실패)"
+        )
+    log.info("세션 전용 번역 모델: %s", model)
+    return tr
 
 
 async def _loopback_source(app, params: dict[str, Any], sample_rate: int):
@@ -266,6 +310,12 @@ async def session_ws(ws: WebSocket, session_id: str) -> None:
         await session.abort()
     finally:
         _sessions(ws.app).pop(session_id, None)
+        own = getattr(session, "translator", None)
+        if own is not None and own is not getattr(ws.app.state, "mt", None):
+            try:
+                await own.close()  # 세션 전용 번역 체인 (mt.model) 의 HTTP 클라이언트
+            except Exception:  # 닫기 실패는 기록만
+                log.debug("세션 번역기 닫기 실패", exc_info=True)
 
 
 def _parse_message(text: str) -> tuple[str | None, dict]:
