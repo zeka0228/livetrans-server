@@ -6,6 +6,7 @@
 - `sub_tgt.m3u8`, `sub_tgt_NNNNN.vtt`, `sub_src.*` (우리가 씀): 미디어와 같은 번호·길이의 세그먼트. 큐 시각은 t_cap 기준이고
   `X-TIMESTAMP-MAP` 으로 미디어 PTS 에 맞춘다 (첫 세그먼트의 start_time 을 ffprobe 로 읽어 보정).
 - 영상(`video_path` 가 있으면): ingest 가 기록 중인 raw.ts 를 `-re` 로 뒤따라 읽어(지연은 시작 시점으로 생김) 복사 먹싱.
+- 첫 세그먼트는 시작 후 약 2 s 안에 생겨야 한다 (파이프 입력 분석 끔). 늦으면 `playing` 이 D 보다 늦게 나간다.
 
 세션이 끝나면 ENDLIST 를 쓰고, 디렉터리는 세션 삭제 때 지운다 (방송 내용을 디스크에 남기지 않음, §13).
 """
@@ -83,6 +84,9 @@ class HlsWriter:
         if self.video_path is not None:
             args += ["-re", "-i", str(self.video_path)]
             maps += ["-map", "0:v:0"]
+        # 파이프 PCM 은 포맷을 이미 아니 분석을 끄지 않으면 ffmpeg 가 기본 5 s 치 오디오가 들어올 때까지
+        # 출력 초기화를 미뤄 첫 세그먼트가 그만큼 늦어진다 (2026-10-24 측정: 5.8 s → 1.8 s)
+        args += ["-analyzeduration", "0", "-probesize", "32"]
         args += ["-f", "s16le", "-ar", str(OUT_RATE), "-ac", "2", "-i", "pipe:0"]
         maps += ["-map", f"{1 if self.video_path is not None else 0}:a:0"]
         args += maps

@@ -56,6 +56,8 @@ async def main() -> None:
         print("[  0.0s]", json.loads(await ws.recv())["payload"])
         await ws.send(json.dumps({"type": "control", "payload": {"action": "start"}}))
         polled = False
+        first_ts = None
+        raw_seen = None
         while True:
             try:
                 msg = await asyncio.wait_for(ws.recv(), timeout=60)
@@ -66,9 +68,21 @@ async def main() -> None:
             events.append(ev)
             p = ev["payload"]
             el = time.time() - t0
+            if first_ts is None:
+                mp = HLS_ROOT / sid / "media.m3u8"
+                raw = HLS_ROOT / sid / "raw.ts"
+                if raw.is_file() and raw_seen is None:
+                    raw_seen = el
+                    print(f"[{el:5.1f}s] raw.ts 생성")
+                if mp.is_file() and ".ts" in mp.read_text(encoding="utf-8", errors="replace"):
+                    first_ts = el
+                    print(f"[{el:5.1f}s] media.m3u8 에 첫 세그먼트")
             if ev["type"] == "session.state":
+                late = ""
+                if p.get("play_start_wall_ms"):
+                    late = f" (play_start 대비 {time.time() - p['play_start_wall_ms'] / 1000:+.1f}s)"
                 print(
-                    f"[{el:5.1f}s] STATE {p['state']} delay={p['delay_s']} play_start_wall_ms={p['play_start_wall_ms']}"
+                    f"[{el:5.1f}s] STATE {p['state']} delay={p['delay_s']} play_start_wall_ms={p['play_start_wall_ms']}{late}"
                 )
                 if p["state"] == "stopped":
                     break
