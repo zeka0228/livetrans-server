@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -55,3 +56,26 @@ def test_hls_writer_produces_media_and_vtt(tmp_path: Path):
     assert any(s["codec_type"] == "audio" and s["codec_name"] == "aac" for s in streams)
     w.remove()
     assert not d.exists()
+
+
+def test_first_segment_appears_quickly_with_realtime_feed(tmp_path: Path):
+    """세션처럼 PCM 을 1 s 에 한 번씩 넣어도 첫 세그먼트가 곧 생겨야 한다.
+
+    ffmpeg 가 파이프 입력을 기본 5 s 치 분석하면 첫 세그먼트가 약 6 s 뒤에 생겨 `playing` 이 D 보다 늦어진다
+    (2026-10-24 실측 5.8 s → 분석 끔 1.8 s)."""
+    w = HlsWriter(tmp_path / "s2", ffmpeg=FFMPEG, segment_s=1.0)
+    w.start()
+    t0 = time.time()
+    ready_at = None
+    for k in range(6):
+        w.write_segment(k, tone_segment(), {"tgt": [], "src": []})
+        deadline = t0 + k + 1
+        while time.time() < deadline:
+            if ready_at is None and w.ready:
+                ready_at = time.time() - t0
+            time.sleep(0.05)
+        if ready_at is not None:
+            break
+    w.close()
+    assert ready_at is not None and ready_at < 3.0, f"첫 세그먼트까지 {ready_at} s"
+    w.remove()

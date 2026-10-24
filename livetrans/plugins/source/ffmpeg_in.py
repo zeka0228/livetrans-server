@@ -74,7 +74,9 @@ class FfmpegSource:
         if self.record_video:
             assert self.record_path is not None
             self.record_path.parent.mkdir(parents=True, exist_ok=True)
-            args += ["-map", "0", "-c", "copy", "-f", "mpegts", str(self.record_path)]
+            # flush_packets: raw.ts 를 패킷마다 디스크에 내려 HLS 쪽이 읽을 때 최신 상태가 되게 (기본은 256 KiB 단위라
+            # 저비트레이트 방송에서 수 초 늦게 보임)
+            args += ["-map", "0", "-c", "copy", "-flush_packets", "1", "-f", "mpegts", str(self.record_path)]
         args += ["-map", "0:a:0", "-vn", "-ac", "2", "-ar", str(OUT_RATE), "-f", "s16le", "pipe:1"]
         try:
             self._proc = subprocess.Popen(  # noqa: ASYNC220
