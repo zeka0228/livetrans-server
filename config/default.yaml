@@ -15,6 +15,8 @@ vad:
   min_silence_ms: 600
   speech_pad_ms: 200
   max_utterance_s: 8.0
+  lane_min_speech_ms: 400     # 화자 레인 경계 조각: 이보다 짧은 발화는 다음 발화(틈 ≤ lane_merge_gap_ms)에 붙이고, 없으면 버림 (2026-10-25)
+  lane_merge_gap_ms: 1500
 stt:
   engine: dicow               # dicow | faster_whisper | fake  (D-019: 화자 조건부 Whisper, 로드 실패 시 fallback)
   model: "BUT-FIT/DiCoW_v3_3" # dicow 가중치 (CC BY 4.0, THIRD_PARTY_NOTICES.md). 미리 받기: scripts/download_models.py

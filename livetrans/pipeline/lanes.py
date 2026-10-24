@@ -6,6 +6,8 @@
 - 확정 경계(`committed_ms`)에서 마지막 구간 뒤로 `min_silence_ms` 이상 지났으면 발화를 닫는다 — 즉 자막은
   화자가 말을 멈춘 뒤 `min_silence + right_context + hop(최대)` 뒤에 확정된다 (지연은 D 로 흡수, 사용자 결정).
 - 말한 시간이 `min_speech_ms` 미만이면 버린다 (강제 분할 뒤 조각은 예외).
+- `lane_min_speech_ms` 미만의 짧은 발화(경계 조각)는 보류했다가 같은 화자의 다음 발화(틈 ≤ `lane_merge_gap_ms`) 앞에 붙인다.
+  다음 발화가 없으면 버린다 — 0.4 s 조각이 혼자 번역·TTS 까지 가던 문제 (2026-10-25).
 
 시각은 전부 t_cap(ms). 오디오는 들고 있지 않다 — 세션이 Diarizer 링버퍼에서 잘라 온다.
 """
@@ -50,6 +52,8 @@ class LaneSegmenter:
         self.speaker = speaker
         self._min_silence = cfg.min_silence_ms
         self._min_speech = cfg.min_speech_ms
+        self._lane_min = cfg.lane_min_speech_ms
+        self._merge_gap = cfg.lane_merge_gap_ms
         self._pad = cfg.speech_pad_ms
         self._max_len = int(cfg.max_utterance_s * 1000)
         self._alloc_id = alloc_id  # 세션 공용 seg_id 발급기 (레인끼리 겹치지 않게)
@@ -57,6 +61,8 @@ class LaneSegmenter:
         self._seg_id: int | None = None
         self._prev_id: int | None = None
         self._forced_head = False
+        # 보류 중인 짧은 조각 (lane_min_speech_ms 미만): 다음 발화에 붙이거나, 틈이 크면 버린다
+        self._pending: list[Interval] = []
 
     # --- 조회 ---
 
@@ -87,7 +93,7 @@ class LaneSegmenter:
             else:
                 if self._open:
                     out.extend(self._close(forced=False))
-                self._open = [(a, b)]
+                self._open = [*self._take_pending(a), (a, b)]
                 self._seg_id = self._alloc_id()
                 self._prev_id = None
                 self._forced_head = False
@@ -97,9 +103,18 @@ class LaneSegmenter:
         return out
 
     def flush(self) -> list[LaneUtterance]:
-        return self._close(forced=False) if self._open else []
+        utts = self._close(forced=False) if self._open else []
+        self._pending = []  # 입력 끝: 보류 조각은 붙일 발화가 없으니 버린다
+        return utts
 
     # --- 내부 ---
+
+    def _take_pending(self, next_start_ms: int) -> list[Interval]:
+        """보류 조각을 새 발화 앞에 붙일지: 틈이 lane_merge_gap_ms 이내면 돌려주고, 아니면 버린다."""
+        pend, self._pending = self._pending, []
+        if pend and next_start_ms - pend[-1][1] <= self._merge_gap:
+            return pend
+        return []
 
     def _maybe_force(self) -> list[LaneUtterance]:
         out: list[LaneUtterance] = []
@@ -125,8 +140,12 @@ class LaneSegmenter:
         ivs, seg_id = self._open, self._seg_id
         spoken = sum(b - a for a, b in ivs)
         keep = spoken >= self._min_speech or self._forced_head
+        # 레인 경계 조각(짧은 발화)은 바로 내보내지 않고 보류 → 같은 화자의 다음 발화 앞에 붙인다 (강제 분할 사슬은 예외)
+        hold = keep and not forced and not self._forced_head and spoken < self._lane_min
         utts: list[LaneUtterance] = []
-        if keep and ivs and seg_id is not None:
+        if hold:
+            self._pending = list(ivs)
+        elif keep and ivs and seg_id is not None:
             utts.append(
                 LaneUtterance(
                     seg_id=seg_id,

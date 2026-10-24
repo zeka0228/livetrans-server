@@ -34,6 +34,10 @@ class VadConfig(BaseModel):
     min_silence_ms: int = 600
     speech_pad_ms: int = 200
     max_utterance_s: float = 8.0
+    # 화자 레인(D-028) 경계 조각: 이보다 짧게 말한 발화는 바로 내보내지 않고 같은 화자의 다음 발화(틈 ≤ lane_merge_gap_ms)에
+    # 붙인다. 다음 발화가 없으면 버린다. 2026-10-25: 0.4 s 조각("sigum")이 그대로 번역·TTS 까지 가던 문제
+    lane_min_speech_ms: int = 400
+    lane_merge_gap_ms: int = 1500
 
 
 class SttConfig(BaseModel):
