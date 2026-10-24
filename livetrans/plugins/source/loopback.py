@@ -1,6 +1,7 @@
 """모드 B 입력: PC 에서 재생 중인 소리를 캡처 (명세 §4.1 `loopback`, D-016).
 
-`target` = `"system"`(기본 출력 장치 전체) 또는 `"pid:<N>"`(그 프로세스 트리의 소리만).
+`target` = `"system"`(기본 출력 장치 전체), `"pid:<N>"`(그 프로세스 트리의 소리만), `"device:<ID>"`(특정 출력 장치 — 모드 A
+격리 장치, 명세 §4.9).
 캡처는 `wincap` 헬퍼가 하고, 16 kHz mono PCM16 을 stdout 으로 받는다. 헬퍼가 무음 구간을 0 으로 채우므로
 수신 샘플 수가 곧 벽시계와 맞는 t_cap 이다 (I2).
 
@@ -28,11 +29,13 @@ class CaptureError(RuntimeError):
 
 
 def parse_target(target: str) -> list[str]:
-    """`system` / `pid:<N>` → wincap 인자. 형식이 틀리면 ValueError."""
+    """`system` / `pid:<N>` / `device:<ID>` → wincap 인자. 형식이 틀리면 ValueError."""
     if target == "system":
         return ["system"]
     if target.startswith("pid:") and target[4:].isdigit():
         return ["pid", target[4:]]
+    if target.startswith("device:") and target[7:].startswith("{"):
+        return ["device", target[7:]]
     raise ValueError(f"알 수 없는 캡처 대상: {target!r}")
 
 
@@ -170,6 +173,16 @@ class CaptureBackend:
         from livetrans.core.wincap import process_alive
 
         return process_alive(pid)
+
+    async def list_devices(self) -> list[dict]:
+        from livetrans.core.wincap import list_devices
+
+        return await list_devices()
+
+    async def meter(self, device_ids: list[str], ms: int) -> dict[str, dict]:
+        from livetrans.core.wincap import meter
+
+        return await meter(device_ids, ms)
 
     async def list_windows(self) -> list[dict]:
         from livetrans.core.wincap import list_windows

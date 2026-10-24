@@ -42,6 +42,42 @@ async def list_windows() -> list[dict]:
     return await asyncio.to_thread(_list_windows_blocking, exe)
 
 
+class WincapTooOld(RuntimeError):
+    """헬퍼가 새 하위 명령(devices/meter/device 캡처)을 모른다 — `scripts\\build_wincap.bat` 로 다시 빌드."""
+
+
+def _run_json(exe: Path, args: list[str], timeout: float):
+    r = subprocess.run(
+        [str(exe), *args],
+        check=False,
+        capture_output=True,
+        timeout=timeout,
+        creationflags=_NO_WINDOW,
+    )
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip()
+        if err.startswith("usage:"):
+            raise WincapTooOld(err)
+        raise RuntimeError(err or f"wincap {args[0]} 실패 (rc={r.returncode})")
+    return json.loads(r.stdout.decode("utf-8"))
+
+
+async def list_devices() -> list[dict]:
+    """출력(렌더) 장치 `[{id, name, state, is_default}]` (명세 §4.9). 헬퍼가 없으면 빈 목록, 옛 빌드면 WincapTooOld."""
+    exe = wincap_path()
+    if exe is None:
+        return []
+    return await asyncio.to_thread(_run_json, exe, ["devices"], 10)
+
+
+async def meter(device_ids: list[str], ms: int) -> dict[str, dict]:
+    """장치별 피크 레벨 `{id: {peak, mean}}` 를 ms 동안 잰다 (격리 점검). 없는 장치는 peak -1."""
+    exe = wincap_path()
+    if exe is None or not device_ids:
+        return {}
+    return await asyncio.to_thread(_run_json, exe, ["meter", str(ms), *device_ids], ms / 1000 + 10)
+
+
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 

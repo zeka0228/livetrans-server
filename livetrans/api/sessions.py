@@ -53,6 +53,8 @@ class SessionCreate(BaseModel):
     delay_s: int | None = None
     tts: TtsSpec = TtsSpec()
     display: DisplaySpec = DisplaySpec()
+    # 모드 A 원본 소리 격리 (명세 §4.9): {"router", "isolation_device"}. loopback 에 target 이 없으면 isolation_device 를 캡처 대상으로
+    route: dict[str, Any] | None = None
 
 
 def _error(status: int, code: str, message: str) -> HTTPException:
@@ -89,6 +91,7 @@ async def create_session(body: SessionCreate, request: Request) -> dict:
     elif combo == ("B", "loopback"):
         source = await _loopback_source(app, body.source.params, sample_rate)
     elif body.mode == "A" and body.source.type in ("obs_stream", "file", "loopback"):
+        _apply_route(app, body)
         source, extra = await _mode_a_setup(app, body, session_id, sample_rate)
     else:
         raise _error(
@@ -178,6 +181,24 @@ async def _mode_a_setup(app, body: SessionCreate, session_id: str, sample_rate: 
     }
 
 
+def _apply_route(app, body: SessionCreate) -> None:
+    """모드 A loopback: `route.isolation_device` 를 캡처 대상으로 쓰고, 격리 모드에서 시스템 전체 캡처는 막는다 (되먹임, 명세 §4.9)."""
+    if body.source.type != "loopback":
+        return
+    params = body.source.params
+    iso = (body.route or {}).get("isolation_device")
+    if not params.get("target") and iso:
+        params["target"] = str(iso)
+    router = (body.route or {}).get("router") or app.state.settings.route.router
+    if router != "none" and str(params.get("target", "system")) == "system":
+        raise _error(
+            400,
+            "E_ROUTE_NOT_ISOLATED",
+            "모드 A 는 시스템 전체 캡처를 쓸 수 없습니다 (지연 출력이 다시 캡처됨). GET /api/audio/devices 의 격리 장치를 "
+            "target(device:…) 으로 주거나, 격리를 끄려면 route.router: none",
+        )
+
+
 async def _loopback_source(app, params: dict[str, Any], sample_rate: int):
     backend = app.state.capture
     if not backend.available():
@@ -189,8 +210,8 @@ async def _loopback_source(app, params: dict[str, Any], sample_rate: int):
         parse_target(target)
     except ValueError as e:
         raise _error(400, "E_CAPTURE_TARGET", str(e)) from e
-    # 창 목록은 UI 용. 대상은 살아 있는 프로세스면 된다 (창 없는 프로세스의 소리도 캡처 가능)
-    if target != "system" and (
+    # 창 목록은 UI 용. 대상은 살아 있는 프로세스면 된다 (창 없는 프로세스의 소리도 캡처 가능). device:… 는 wincap 이 검사
+    if target.startswith("pid:") and (
         not backend.app_capture_supported() or not backend.process_alive(int(target[4:]))
     ):
         raise _error(

@@ -56,6 +56,18 @@ uv run pytest
 
 `GET /api/health` 의 `process.rss_mb / private_mb` 로 추적할 수 있습니다. 가장 가벼운 구성은 `diar.engine: none` + `stt.rescue: null` (RAM ≈ 2.4 GB, VRAM ≈ 3 GB + Ollama).
 
+## 원본 소리 격리 (모드 A, 명세 §4.9)
+
+목표는 **실제 방송 소리는 사용자에게 들리지 않고 서버만 듣게**, 사용자는 **D 초 지연된 영상 소리·번역 음성·자막만** 듣고 보는 것입니다.
+
+1. `GET /api/audio/devices` 로 출력 장치 목록을 받아 **격리 장치**를 고릅니다 — 안 쓰는 실제 출력 장치(예: 모니터 HDMI 오디오). 사용자 기본 출력 장치(`is_default`)는 고를 수 없습니다.
+2. Windows 설정 → 시스템 → 소리 → **볼륨 믹서**에서 원본 방송을 재생하는 앱(브라우저)의 출력 장치를 격리 장치로 바꿉니다. OBS 로 영상까지 보내면 OBS 의 "오디오 출력 캡처" 소스 장치도 격리 장치로. 격리 장치가 모니터면 모니터 스피커 볼륨을 0 으로.
+3. `POST /api/audio/route/check {router: "spare_device", isolation_device: "device:…"}` 로 점검합니다 — 격리 장치가 살아 있고, 기본 장치와 다르고, 원본이 실제로 격리 장치로 나가며(피크 레벨), 스피커로 새지 않으면 `isolated: true`. 문제는 `problems[]` 에 한국어로, 설정법은 `setup_guide`/`restore_guide` 에.
+4. 세션 요청에 `source: {type: "loopback", params: {target: "device:…"}}` (또는 `route: {router, isolation_device}`) 를 주면 서버가 그 장치만 캡처합니다. 격리 모드(`route.router` 가 `none` 이 아님)에서 모드 A 의 시스템 전체 캡처는 400 `E_ROUTE_NOT_ISOLATED` 로 막습니다(지연 출력이 다시 캡처되는 되먹임 방지).
+5. 끝나면 볼륨 믹서에서 앱의 출력 장치를 기본값으로 되돌립니다.
+
+`wincap` 헬퍼에 `devices` / `meter` / `capture device <ID>` 하위 명령이 필요하므로 `scriptsuild_wincap.bat` 로 다시 빌드하세요 (옛 빌드면 `/api/audio/*` 가 501 로 알려 줍니다).
+
 ## Rights & Responsible Use
 
 - 이 프로젝트는 개인 시청 보조 도구입니다. 번역 결과물을 업로드·재배포하는 기능은 제공하지 않습니다.
